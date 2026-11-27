@@ -191,6 +191,12 @@ type DB struct {
 	lastSuccessfulSyncMu sync.RWMutex
 	lastSuccessfulSyncAt time.Time
 
+	// Persistent upload journal and latest startup reconciliation report.
+	uploadJournalMu          sync.Mutex
+	uploadJournal            *UploadJournal
+	uploadReconcileMu        sync.RWMutex
+	lastUploadReconciliation *UploadReconciliationReport
+
 	// Where to send log messages, defaults to global slog with database epath.
 	Logger *slog.Logger
 }
@@ -594,7 +600,10 @@ func (db *DB) MetaPath() string {
 
 // SetMetaPath sets the path to database metadata.
 func (db *DB) SetMetaPath(path string) {
+	db.uploadJournalMu.Lock()
+	defer db.uploadJournalMu.Unlock()
 	db.metaPath = path
+	db.uploadJournal = NewUploadJournal(path)
 }
 
 // LTXDir returns path of the root LTX directory.
@@ -767,6 +776,9 @@ type SyncStatus struct {
 	LocalTXID  ltx.TXID
 	RemoteTXID ltx.TXID
 	InSync     bool
+
+	// UploadReconciliation is the most recent startup self-check report.
+	UploadReconciliation *UploadReconciliationReport
 }
 
 // SyncStatus returns the current replication status of the database, comparing
@@ -788,9 +800,10 @@ func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
 	}
 
 	return SyncStatus{
-		LocalTXID:  localPos.TXID,
-		RemoteTXID: remotePos.TXID,
-		InSync:     localPos.TXID > 0 && localPos.TXID == remotePos.TXID,
+		LocalTXID:            localPos.TXID,
+		RemoteTXID:           remotePos.TXID,
+		InSync:               localPos.TXID > 0 && localPos.TXID == remotePos.TXID,
+		UploadReconciliation: db.LastUploadReconciliation(),
 	}, nil
 }
 
@@ -877,6 +890,14 @@ func (db *DB) Open() (err error) {
 	// Clear old temporary files that my have been left from a crash.
 	if err := removeTmpFiles(db.metaPath); err != nil {
 		return fmt.Errorf("cannot remove tmp files: %w", err)
+	}
+
+	// Reconcile persisted upload records with remote objects before monitors
+	// start. This is a no-op when the journal is empty. Recovery failures are
+	// persisted in the reconciliation report and returned rather than logged
+	// and ignored.
+	if err := db.startupReconcileUploads(); err != nil {
+		return fmt.Errorf("startup upload reconciliation: %w", err)
 	}
 
 	// Set the compactor client once before starting any goroutines.
@@ -3108,9 +3129,16 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	}
 	defer func() { _ = r.Close() }()
 
+	record, err := db.beginLTXUploadRecord(SnapshotLevel, 1, pos.TXID, "")
+	if err != nil {
+		return nil, fmt.Errorf("persist snapshot upload state: %w", err)
+	}
 	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
 	if err != nil {
-		return info, err
+		return info, db.failUploadRecord(record, fmt.Errorf("write snapshot: %w", err))
+	}
+	if err := db.completeLTXUploadRecord(record, info); err != nil {
+		return info, fmt.Errorf("persist snapshot completion state: %w", err)
 	}
 
 	db.maxLTXFileInfos.Lock()

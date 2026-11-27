@@ -77,6 +77,32 @@ func (c *StatusCommand) Run(ctx context.Context, args []string) (err error) {
 			status.WALSize,
 		)
 	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+
+	for _, status := range statuses {
+		report := status.UploadReconciliation
+		if report == nil || report.Total == 0 {
+			continue
+		}
+		fmt.Printf("upload reconciliation %s: total=%d healthy=%d remote_missing=%d remote_corrupt=%d local_record_expired=%d recovered=%d failed=%d\n",
+			status.Database, report.Total, report.Healthy, report.Missing, report.Corrupt,
+			report.Stale, report.Recovered, report.Failed)
+		for _, item := range report.Items {
+			decision := string(item.Decision)
+			reason := item.Reason
+			if (decision == "" || decision == string(litestream.UploadDecisionNone)) && item.LastRecoveryDecision != "" {
+				decision = "last_" + string(item.LastRecoveryDecision)
+				reason = item.LastRecoveryReason
+			}
+			if decision == "" || decision == string(litestream.UploadDecisionNone) {
+				continue
+			}
+			fmt.Printf("  %s: diagnosis=%s decision=%s reason=%s\n",
+				item.ID, item.Diagnosis, decision, reason)
+		}
+	}
 
 	return nil
 }
@@ -87,15 +113,26 @@ type DBStatus struct {
 	Status    string `json:"status"`
 	LocalTXID string `json:"local_txid"`
 	WALSize   string `json:"wal_size"`
+
+	// UploadReconciliation is the latest startup self-check report, when one
+	// has been written into the database metadata directory.
+	UploadReconciliationPath string                                 `json:"upload_reconciliation_path,omitempty"`
+	UploadReconciliation     *litestream.UploadReconciliationReport `json:"upload_reconciliation,omitempty"`
 }
 
 // getDBStatus gathers status information for a database.
 func (c *StatusCommand) getDBStatus(db *litestream.DB) DBStatus {
 	status := DBStatus{
-		Database:  db.Path(),
-		Status:    "unknown",
-		LocalTXID: "-",
-		WALSize:   "-",
+		Database:                 db.Path(),
+		Status:                   "unknown",
+		LocalTXID:                "-",
+		WALSize:                  "-",
+		UploadReconciliationPath: db.UploadReconciliationReportPath(),
+	}
+	if report, err := db.ReadUploadReconciliationReport(); err == nil {
+		status.UploadReconciliation = report
+	} else if !os.IsNotExist(err) {
+		status.Status = "reconciliation error"
 	}
 
 	// Check if database file exists.

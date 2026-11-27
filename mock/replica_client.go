@@ -2,6 +2,7 @@ package mock
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 
@@ -18,6 +19,7 @@ type ReplicaClient struct {
 	LTXFilesFunc       func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error)
 	OpenLTXFileFunc    func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error)
 	WriteLTXFileFunc   func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error)
+	ResumeLTXFileFunc  func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, uploadID string, resumeOffset int64, r io.Reader) (*ltx.FileInfo, error)
 	DeleteLTXFilesFunc func(ctx context.Context, a []*ltx.FileInfo) error
 }
 
@@ -44,6 +46,13 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
 	return c.WriteLTXFileFunc(ctx, level, minTXID, maxTXID, r)
+}
+
+func (c *ReplicaClient) ResumeLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, uploadID string, resumeOffset int64, r io.Reader) (*ltx.FileInfo, error) {
+	if c.ResumeLTXFileFunc == nil {
+		return nil, errors.New("mock ReplicaClient.ResumeLTXFileFunc not set")
+	}
+	return c.ResumeLTXFileFunc(ctx, level, minTXID, maxTXID, uploadID, resumeOffset, r)
 }
 
 func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {

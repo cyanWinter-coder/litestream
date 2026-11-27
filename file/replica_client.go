@@ -27,6 +27,7 @@ func init() {
 const ReplicaClientType = "file"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ResumableLTXReplicaClient = (*ReplicaClient)(nil)
 var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to disk.
@@ -235,6 +236,53 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	return info, nil
+}
+
+// ResumeLTXFile appends the remaining bytes to a partial destination object.
+// Startup reconciliation only calls this after verifying that the existing
+// prefix byte-matches the local source. LTX objects are otherwise immutable;
+// this completes an unpublished/incomplete object rather than modifying a
+// valid one.
+func (c *ReplicaClient) ResumeLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, _ string, resumeOffset int64, rd io.Reader) (info *ltx.FileInfo, err error) {
+	filename := c.LTXFilePath(level, minTXID, maxTXID)
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if fi.Size() != resumeOffset {
+		return nil, fmt.Errorf("file: resume offset %d does not match partial object size %d", resumeOffset, fi.Size())
+	}
+
+	if _, err := io.Copy(f, rd); err != nil {
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	if err := internal.FsyncDir(filepath.Dir(filename)); err != nil {
+		return nil, err
+	}
+
+	fi, err = os.Stat(filename)
+	if err != nil {
+		return nil, err
+	}
+	return &ltx.FileInfo{
+		Level:     level,
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
+		Size:      fi.Size(),
+		CreatedAt: fi.ModTime().UTC(),
+	}, nil
 }
 
 // DeleteLTXFiles deletes LTX files.
