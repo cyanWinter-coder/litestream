@@ -3463,7 +3463,9 @@ func (f *VFSFile) monitorSnapshots(ctx context.Context) {
 				// Enforce snapshot retention after creating new snapshot
 				if f.vfs.SnapshotRetention > 0 {
 					if _, err := f.compactor.EnforceSnapshotRetention(ctx, f.vfs.SnapshotRetention); err != nil {
-						f.logger.Error("snapshot retention failed", "error", err)
+						if !errors.Is(err, ErrRetentionInProgress) {
+							f.logger.Error("snapshot retention failed", "error", err)
+						}
 					}
 				}
 			}
@@ -3490,10 +3492,12 @@ func (f *VFSFile) monitorL0Retention(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := f.compactor.EnforceL0Retention(ctx, f.vfs.L0Retention); err != nil {
-				if !errors.Is(err, context.Canceled) &&
-					!errors.Is(err, context.DeadlineExceeded) {
-					f.logger.Error("L0 retention enforcement failed", "error", err)
+				if errors.Is(err, ErrRetentionInProgress) ||
+					errors.Is(err, context.Canceled) ||
+					errors.Is(err, context.DeadlineExceeded) {
+					continue
 				}
+				f.logger.Error("L0 retention enforcement failed", "error", err)
 			}
 		}
 	}

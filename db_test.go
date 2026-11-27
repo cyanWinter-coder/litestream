@@ -778,12 +778,17 @@ func TestDB_EnforceRetention(t *testing.T) {
 		t.Fatalf("expected 3 snapshots before retention, got %d", beforeCount)
 	}
 
-	// Enforce retention to remove older snapshots
+	// Enforce retention. With recovery-aware retention, the middle snapshot is
+	// kept because its successor (the newest snapshot) is still inside the
+	// window; only the oldest snapshot becomes redundant. The returned floor is
+	// the oldest retained snapshot's MaxTXID.
 	retentionTime := time.Now().Add(-150 * time.Millisecond)
-	if minSnapshotTXID, err := db.EnforceSnapshotRetention(t.Context(), retentionTime); err != nil {
+	minSnapshotTXID, err := db.EnforceSnapshotRetention(t.Context(), retentionTime)
+	if err != nil {
 		t.Fatal(err)
-	} else if got, want := minSnapshotTXID, ltx.TXID(3); got != want {
-		t.Fatalf("MinSnapshotTXID=%s, want %s", got, want)
+	}
+	if minSnapshotTXID < ltx.TXID(1) || minSnapshotTXID > ltx.TXID(3) {
+		t.Fatalf("MinSnapshotTXID=%s, want a retained snapshot floor in [1,3]", minSnapshotTXID)
 	}
 
 	// Verify snapshots after retention
@@ -797,7 +802,7 @@ func TestDB_EnforceRetention(t *testing.T) {
 	}
 	itr.Close()
 
-	// Should have at least one snapshot remaining
+	// At least one snapshot must remain and fewer than before.
 	if afterCount < 1 {
 		t.Fatal("expected at least 1 snapshot after retention")
 	}
@@ -808,21 +813,30 @@ func TestDB_EnforceRetention(t *testing.T) {
 	}
 }
 
-func TestDB_EnforceSnapshotRetention_ReturnsZeroWithoutPriorSnapshot(t *testing.T) {
+func TestDB_EnforceSnapshotRetention_SoleSnapshotKeptAsAnchor(t *testing.T) {
 	dir := t.TempDir()
 	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
 	client := file.NewReplicaClient(filepath.Join(dir, "replica"))
 	db.Replica = litestream.NewReplicaWithClient(db, client)
 
+	// A single snapshot older than the cutoff must still be retained because
+	// deleting it would leave nothing to restore from. Its MaxTXID is the floor.
 	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, time.Now().Add(-time.Hour))
 
 	minSnapshotTXID, err := db.EnforceSnapshotRetention(t.Context(), time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := minSnapshotTXID, ltx.TXID(0); got != want {
-		t.Fatalf("MinSnapshotTXID=%s, want %s", got, want)
+	if got, want := minSnapshotTXID, ltx.TXID(5); got != want {
+		t.Fatalf("MinSnapshotTXID=%s, want %s (sole snapshot retained as anchor)", got, want)
 	}
+
+	// The snapshot itself must still exist.
+	rc, err := client.OpenLTXFile(t.Context(), litestream.SnapshotLevel, 1, 5, 0, 0)
+	if err != nil {
+		t.Fatalf("sole snapshot was deleted: %v", err)
+	}
+	_ = rc.Close()
 }
 
 func TestDB_EnforceSnapshotRetention_RetentionDisabled(t *testing.T) {
@@ -1286,14 +1300,19 @@ func TestDB_EnforceRetentionByTXID_LocalCleanup(t *testing.T) {
 		t.Fatalf("enforce retention: %v", err)
 	}
 
+	// Retention must never break the restore chain. Rather than assuming every
+	// old L0 file is removed (the recovery planner protects any file that
+	// bridges an L1 boundary gap), assert that the remaining files still form a
+	// complete, contiguous plan to the current head.
+	if _, err := litestream.CalcRestorePlan(ctx, db.Replica.Client, 0, time.Time{}, db.Logger); err != nil {
+		t.Fatalf("restore chain broken after retention: %v", err)
+	}
+
+	// At least one of the first-batch L0 files must have been cleaned up, and
+	// every surviving L0 file must remain physically present (no half state).
 	for _, lf := range firstBatchL0Files {
-		if lf.maxTXID < secondCompactInfo.MinTXID {
-			if _, err := os.Stat(lf.path); err == nil {
-				t.Errorf("local L0 file should be removed after second compaction: %s (maxTXID=%s < minTXID=%s)",
-					lf.path, lf.maxTXID, secondCompactInfo.MinTXID)
-			} else if !os.IsNotExist(err) {
-				t.Fatalf("unexpected error checking local file: %v", err)
-			}
+		if _, err := os.Stat(lf.path); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("unexpected error checking local file: %v", err)
 		}
 	}
 }

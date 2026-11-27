@@ -624,7 +624,8 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			}
 
 			if lvl.Level == SnapshotLevel {
-				if err := s.EnforceSnapshotRetention(ctx, db); err != nil && !isShutdownError(ctx, err) {
+				if err := s.EnforceSnapshotRetention(ctx, db); err != nil &&
+					!isShutdownError(ctx, err) && !errors.Is(err, ErrRetentionInProgress) {
 					db.Logger.Error("retention enforcement failed", "error", err)
 				}
 			}
@@ -674,7 +675,7 @@ LOOP:
 				continue // skip disabled DBs
 			}
 			if err := db.EnforceL0RetentionByTime(ctx); err != nil {
-				if isShutdownError(ctx, err) {
+				if isShutdownError(ctx, err) || errors.Is(err, ErrRetentionInProgress) {
 					continue
 				}
 				db.Logger.Error("l0 retention enforcement failed", "path", db.Path(), "error", err)

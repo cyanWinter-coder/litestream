@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -262,22 +263,23 @@ func TestCompactor_MaxLTXFileInfo(t *testing.T) {
 }
 
 func TestCompactor_EnforceRetentionByTXID(t *testing.T) {
-	t.Run("DeletesOldFiles", func(t *testing.T) {
+	t.Run("ProtectsGapBridgingFiles", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())
 
-		// Create files at L1
+		// Create files at L1. The first file starts at TXID 1, so deleting it
+		// would leave the next file starting at TXID 3 with a hole at TXID 2.
+		// Recovery-aware retention must protect it even though its MaxTXID is
+		// below the requested floor.
 		createTestLTXFile(t, client, 1, 1, 2)
 		createTestLTXFile(t, client, 1, 3, 5)
 		createTestLTXFile(t, client, 1, 6, 10)
 
-		// Enforce retention - delete files below TXID 5
 		err := compactor.EnforceRetentionByTXID(context.Background(), 1, 5)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		// Verify only the first file was deleted
 		info, err := compactor.MaxLTXFileInfo(context.Background(), 1)
 		if err != nil {
 			t.Fatal(err)
@@ -286,7 +288,7 @@ func TestCompactor_EnforceRetentionByTXID(t *testing.T) {
 			t.Errorf("MaxTXID=%d, want 10", info.MaxTXID)
 		}
 
-		// Check that files starting from TXID 3 are still present
+		// All three files must remain: removing the first breaks contiguity.
 		itr, err := client.LTXFiles(context.Background(), 1, 0, false)
 		if err != nil {
 			t.Fatal(err)
@@ -297,8 +299,30 @@ func TestCompactor_EnforceRetentionByTXID(t *testing.T) {
 		for itr.Next() {
 			count++
 		}
-		if count != 2 {
-			t.Errorf("file count=%d, want 2", count)
+		if count != 3 {
+			t.Errorf("file count=%d, want 3 (gap-bridging file protected)", count)
+		}
+	})
+
+	t.Run("DeletesRedundantFilesCoveredByHigherLevel", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// A snapshot covers TXIDs 1-5, so the L1 files within that range are
+		// redundant for recovery and may be removed.
+		createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, time.Now())
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 1, 3, 5)
+		createTestLTXFile(t, client, 1, 6, 10)
+
+		if err := compactor.EnforceRetentionByTXID(context.Background(), 1, 6); err != nil {
+			t.Fatal(err)
+		}
+
+		got := listLevelTXIDs(t, context.Background(), client, 1)
+		want := []string{"0000000000000006-000000000000000a.ltx"}
+		if !slices.Equal(got, want) {
+			t.Errorf("L1 files=%v, want %v (files below snapshot anchor deleted)", got, want)
 		}
 	})
 
@@ -324,6 +348,22 @@ func TestCompactor_EnforceRetentionByTXID(t *testing.T) {
 			t.Errorf("MaxTXID=%d, want 2 (last file should be kept)", info.MaxTXID)
 		}
 	})
+}
+
+// listLevelTXIDs returns the formatted LTX filenames present at a level.
+func listLevelTXIDs(t *testing.T, ctx context.Context, client litestream.ReplicaClient, level int) []string {
+	t.Helper()
+	itr, err := client.LTXFiles(ctx, level, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer itr.Close()
+	var names []string
+	for itr.Next() {
+		info := itr.Item()
+		names = append(names, ltx.FormatFilename(info.MinTXID, info.MaxTXID))
+	}
+	return names
 }
 
 func TestCompactor_EnforceL0Retention(t *testing.T) {
@@ -397,35 +437,58 @@ func TestCompactor_EnforceL0Retention(t *testing.T) {
 }
 
 func TestCompactor_EnforceSnapshotRetention(t *testing.T) {
-	t.Run("DeletesOldSnapshots", func(t *testing.T) {
+	t.Run("KeepsAnchorForWindow", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())
 
-		// Create snapshot files with different timestamps
+		// Snapshots at -2h, -30m, -5m with a one-hour retention window.
 		createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, time.Now().Add(-2*time.Hour))
 		createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 10, time.Now().Add(-30*time.Minute))
 		createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 15, time.Now().Add(-5*time.Minute))
 
-		// Enforce retention - keep snapshots from last hour
-		_, err := compactor.EnforceSnapshotRetention(context.Background(), time.Hour)
+		// The -2h snapshot's successor (-30m) is still inside the window, so
+		// no snapshot is removed. The oldest retained snapshot (-2h, MaxTXID 5)
+		// is the conservative recovery floor.
+		anchorTXID, err := compactor.EnforceSnapshotRetention(context.Background(), time.Hour)
 		if err != nil {
 			t.Fatal(err)
 		}
+		if anchorTXID != 5 {
+			t.Errorf("anchorTXID=%d, want 5 (oldest retained snapshot)", anchorTXID)
+		}
 
-		// Count remaining snapshots
-		itr, err := client.LTXFiles(context.Background(), litestream.SnapshotLevel, 0, false)
+		got := listLevelTXIDs(t, context.Background(), client, litestream.SnapshotLevel)
+		if len(got) != 3 {
+			t.Errorf("snapshot count=%d, want 3 (anchor snapshot protected): %v", len(got), got)
+		}
+	})
+
+	t.Run("DeletesSnapshotWithSuccessorAlsoOutsideWindow", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Four snapshots with a one-hour window. The oldest snapshot (-4h) has
+		// a successor (-2h) that is itself outside the window, so the -4h
+		// snapshot's time points remain recoverable from -2h and it may be
+		// deleted. The -2h snapshot's successor (-30m) is inside the window,
+		// so -2h becomes the retained anchor.
+		now := time.Now()
+		createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, now.Add(-4*time.Hour))
+		createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 10, now.Add(-2*time.Hour))
+		createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 15, now.Add(-30*time.Minute))
+		createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 20, now.Add(-5*time.Minute))
+
+		anchorTXID, err := compactor.EnforceSnapshotRetention(context.Background(), time.Hour)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer itr.Close()
-
-		var count int
-		for itr.Next() {
-			count++
+		if anchorTXID != 10 {
+			t.Errorf("anchorTXID=%d, want 10 (oldest snapshot whose successor is in-window)", anchorTXID)
 		}
-		// Should have 2 snapshots (the 30min and 5min old ones)
-		if count != 2 {
-			t.Errorf("snapshot count=%d, want 2", count)
+
+		got := listLevelTXIDs(t, context.Background(), client, litestream.SnapshotLevel)
+		if len(got) != 3 {
+			t.Errorf("snapshot count=%d, want 3 (only the -4h snapshot removed): %v", len(got), got)
 		}
 	})
 }
@@ -441,9 +504,13 @@ func TestCompactor_EnforceSnapshotRetention_RetentionDisabled(t *testing.T) {
 		return nil
 	}
 
-	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, time.Now().Add(-2*time.Hour))
-	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 10, time.Now().Add(-30*time.Minute))
-	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 15, time.Now().Add(-5*time.Minute))
+	// Four snapshots with a one-hour window; only the oldest one (-4h) has a
+	// successor (-2h) also outside the window and is therefore deletable.
+	now := time.Now()
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, now.Add(-4*time.Hour))
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 10, now.Add(-2*time.Hour))
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 15, now.Add(-30*time.Minute))
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 20, now.Add(-5*time.Minute))
 
 	_, err := compactor.EnforceSnapshotRetention(context.Background(), time.Hour)
 	if err != nil {
@@ -461,11 +528,11 @@ func TestCompactor_EnforceSnapshotRetention_RetentionDisabled(t *testing.T) {
 	for itr.Next() {
 		count++
 	}
-	if count != 3 {
-		t.Errorf("remote file count=%d, want 3 (no remote deletion)", count)
+	if count != 4 {
+		t.Errorf("remote file count=%d, want 4 (no remote deletion)", count)
 	}
 
-	// Local file deleter should still have been called.
+	// The one redundant snapshot still flows to local cache cleanup.
 	if len(localDeleted) != 1 {
 		t.Errorf("local deleted count=%d, want 1", len(localDeleted))
 	}
@@ -482,11 +549,14 @@ func TestCompactor_EnforceRetentionByTXID_RetentionDisabled(t *testing.T) {
 		return nil
 	}
 
+	// A snapshot makes the two low L1 files redundant; the gap protection no
+	// longer applies because the snapshot covers their TXID range.
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, time.Now())
 	createTestLTXFile(t, client, 1, 1, 2)
 	createTestLTXFile(t, client, 1, 3, 5)
 	createTestLTXFile(t, client, 1, 6, 10)
 
-	err := compactor.EnforceRetentionByTXID(context.Background(), 1, 5)
+	err := compactor.EnforceRetentionByTXID(context.Background(), 1, 6)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,9 +576,9 @@ func TestCompactor_EnforceRetentionByTXID_RetentionDisabled(t *testing.T) {
 		t.Errorf("remote file count=%d, want 3 (no remote deletion)", count)
 	}
 
-	// Local file deleter should still have been called for the file below TXID 5.
-	if len(localDeleted) != 1 {
-		t.Errorf("local deleted count=%d, want 1", len(localDeleted))
+	// Local cache cleanup still runs for the two redundant L1 files.
+	if len(localDeleted) != 2 {
+		t.Errorf("local deleted count=%d, want 2", len(localDeleted))
 	}
 }
 

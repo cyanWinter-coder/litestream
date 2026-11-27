@@ -80,6 +80,12 @@ type DB struct {
 	syncState syncState
 	syncDiag  diagState
 
+	// retentionMu serializes retention enforcement for this database so that
+	// duplicate scheduler ticks cannot delete the same batch of files at the
+	// same time. It is distinct from mu because enforcement talks to the
+	// replica client and must not block or be blocked by sync state updates.
+	retentionMu sync.Mutex
+
 	lastLTXPage *verifiedLTXPage
 
 	// last file info for each level
@@ -3120,81 +3126,105 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	return info, nil
 }
 
-// EnforceSnapshotRetention enforces retention of the snapshot level in the database by timestamp.
-func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time) (minSnapshotTXID ltx.TXID, err error) {
-	db.Logger.Debug("enforcing snapshot retention", "timestamp", timestamp)
+// EnforceSnapshotRetention enforces retention of the snapshot level while
+// keeping every time point inside the retention window recoverable.
+//
+// A snapshot is deleted only when its younger successor is itself older than
+// the cutoff, so the successor remains a valid recovery anchor for every time
+// point the deleted snapshot used to serve. The returned floor is the MaxTXID
+// of the oldest retained snapshot; lower-level files below it are redundant,
+// while files at or above it are retained to support in-flight restore plans.
+func (db *DB) EnforceSnapshotRetention(ctx context.Context, cutoff time.Time) (minSnapshotTXID ltx.TXID, err error) {
+	if !db.retentionMu.TryLock() {
+		db.Logger.Debug("retention enforcement already in progress, skipping")
+		return 0, ErrRetentionInProgress
+	}
+	defer db.retentionMu.Unlock()
 
-	// Normal operation - use fast timestamps
+	db.Logger.Debug("enforcing snapshot retention", "cutoff", cutoff)
+	enforcedAt := time.Now()
+
 	itr, err := db.Replica.Client.LTXFiles(ctx, SnapshotLevel, 0, false)
 	if err != nil {
 		return 0, fmt.Errorf("fetch ltx files: %w", err)
 	}
-	defer itr.Close()
-
-	var deleted []*ltx.FileInfo
 	var snapshots []*ltx.FileInfo
-	var lastInfo *ltx.FileInfo
 	for itr.Next() {
-		info := itr.Item()
-		snapshots = append(snapshots, info)
-		lastInfo = info
-
-		// If this snapshot is before the retention timestamp, mark it for deletion.
-		if info.CreatedAt.Before(timestamp) {
-			deleted = append(deleted, info)
-			continue
+		snapshots = append(snapshots, itr.Item())
+	}
+	if err := itr.Close(); err != nil {
+		return 0, fmt.Errorf("close snapshot iterator: %w", err)
+	}
+	slices.SortFunc(snapshots, func(a, b *ltx.FileInfo) int {
+		if a.MinTXID != b.MinTXID {
+			if a.MinTXID < b.MinTXID {
+				return -1
+			}
+			return 1
 		}
+		if a.MaxTXID < b.MaxTXID {
+			return -1
+		}
+		return 1
+	})
+
+	if len(snapshots) == 0 {
+		return 0, nil
 	}
 
-	// If this is the snapshot level, we need to ensure that at least one snapshot exists.
-	if len(deleted) > 0 && deleted[len(deleted)-1] == lastInfo {
-		deleted = deleted[:len(deleted)-1]
+	// The newest snapshot is always retained. Every older snapshot is a
+	// candidate only when its successor is already outside the window; the
+	// oldest surviving snapshot is the recovery anchor.
+	candidates, anchor := classifySnapshots(snapshots, cutoff)
+
+	plan, err := BuildRetentionPlan(snapshots, candidates, enforcedAt, cutoff, anchor.MaxTXID, anchor.MaxTXID)
+	if err != nil {
+		return 0, err
 	}
 
-	// Use the last deleted snapshot's MaxTXID, rather than the first retained
-	// snapshot's MaxTXID, to preserve lower-level files in an in-flight restore
-	// plan. TestStore_EnforceSnapshotRetention_RetainsInFlightRestorePlanFiles
-	// guards this conservative floor.
-	for i, info := range snapshots {
-		if slices.Contains(deleted, info) {
-			continue
+	executor := NewRetentionExecutor(db.Replica.Client, db.Logger, db.RetentionEnabled)
+	executor.EnforcedAt = enforcedAt
+	executor.LocalFileDeleter = func(level int, minTXID, maxTXID ltx.TXID) error {
+		localPath := db.LTXPath(level, minTXID, maxTXID)
+		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+			return err
 		}
-		if i > 0 {
-			minSnapshotTXID = snapshots[i-1].MaxTXID
-		}
-		break
+		return nil
 	}
 
-	// Remove files marked for deletion from remote storage (unless retention disabled).
-	if !db.RetentionEnabled {
-		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
-	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	report, err := executor.Execute(ctx, plan)
+	if err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
+	LogProtected(db.Logger, report)
 
-	// Always clean up local files.
-	for _, info := range deleted {
-		localPath := db.LTXPath(SnapshotLevel, info.MinTXID, info.MaxTXID)
-		db.Logger.Debug("deleting local ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
-
-		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
-			db.Logger.Error("failed to remove local ltx file", "path", localPath, "error", err)
-		}
-	}
+	// Conservative floor for cascading lower-level retention. The anchor is
+	// the oldest snapshot that remains, so lower-level files below its MaxTXID
+	// are redundant; files at or above the floor stay because an in-flight
+	// restore plan may still reference them.
+	minSnapshotTXID = anchor.MaxTXID
 
 	return minSnapshotTXID, nil
 }
 
 // EnforceL0RetentionByTime retains L0 files until they have been compacted into
-// L1 and have existed for at least L0Retention.
+// L1 and have existed for at least L0Retention. The cross-level recovery
+// planner then protects any file still required to keep the restore chain
+// contiguous, so a missing or incomplete L1 file cannot cause a gap.
 func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	if db.L0Retention <= 0 {
 		return nil
 	}
+	if !db.retentionMu.TryLock() {
+		db.Logger.Debug("retention enforcement already in progress, skipping")
+		return ErrRetentionInProgress
+	}
+	defer db.retentionMu.Unlock()
 
 	db.Logger.Debug("starting l0 retention enforcement", "retention", db.L0Retention)
 
 	dbName := filepath.Base(db.Path())
+	enforcedAt := time.Now()
 
 	// Determine the highest TXID that has been compacted into L1.
 	itr, err := db.Replica.Client.LTXFiles(ctx, 1, 0, false)
@@ -3218,95 +3248,106 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
-	threshold := time.Now().Add(-db.L0Retention)
-	itr, err = db.Replica.Client.LTXFiles(ctx, 0, 0, false)
+	threshold := enforcedAt.Add(-db.L0Retention)
+
+	allFiles, err := collectAllLTXFiles(ctx, db.Replica.Client, SnapshotLevel-1)
 	if err != nil {
-		return fmt.Errorf("fetch l0 files: %w", err)
+		return err
 	}
-	defer itr.Close()
 
 	var (
-		deleted           []*ltx.FileInfo
-		lastInfo          *ltx.FileInfo
-		processedAll      = true
+		headTXID          ltx.TXID
+		anchorTXID        ltx.TXID
 		totalFiles        int
 		notCompactedCount int
 		tooRecentCount    int
+		newestL0          *ltx.FileInfo
+		candidates        []*ltx.FileInfo
 	)
-	for itr.Next() {
-		info := itr.Item()
-		lastInfo = info
+	for _, info := range allFiles {
+		if info.MaxTXID > headTXID {
+			headTXID = info.MaxTXID
+		}
+		if info.Level == SnapshotLevel && (anchorTXID == 0 || info.MaxTXID < anchorTXID) {
+			anchorTXID = info.MaxTXID
+		}
+		if info.Level != 0 {
+			continue
+		}
 		totalFiles++
+		if newestL0 == nil || info.MaxTXID > newestL0.MaxTXID {
+			newestL0 = info
+		}
 
 		createdAt := info.CreatedAt
 		if createdAt.IsZero() {
-			if fi, err := os.Stat(db.LTXPath(0, info.MinTXID, info.MaxTXID)); err == nil {
+			if fi, statErr := os.Stat(db.LTXPath(0, info.MinTXID, info.MaxTXID)); statErr == nil {
 				createdAt = fi.ModTime().UTC()
 			} else {
 				createdAt = threshold
 			}
 		}
 
+		// In-flight or newer-than-threshold files stay; the planner's own
+		// enforcedAt guard is a second line of defense.
 		if createdAt.After(threshold) {
-			// L0 entries are ordered; once we reach a newer file we stop so we don't
-			// create gaps between retained files. VFS expects contiguous coverage.
-			processedAll = false
 			tooRecentCount++
-			break
+			continue
 		}
-
 		if info.MaxTXID <= maxL1TXID {
-			deleted = append(deleted, info)
+			candidates = append(candidates, info)
 		} else {
 			notCompactedCount++
 		}
 	}
-
-	// Count remaining files as too_recent if we stopped early
-	if !processedAll {
-		for itr.Next() {
-			tooRecentCount++
+	// Never delete the newest L0 file; VFS expects contiguous tail coverage.
+	if newestL0 != nil {
+		filtered := candidates[:0]
+		for _, info := range candidates {
+			if info != newestL0 {
+				filtered = append(filtered, info)
+			}
 		}
+		candidates = filtered
 	}
 
-	// Ensure we do not delete the newest L0 file only if we processed the entire level.
-	if processedAll && len(deleted) > 0 && lastInfo != nil && deleted[len(deleted)-1] == lastInfo {
-		deleted = deleted[:len(deleted)-1]
+	plan, err := BuildRetentionPlan(allFiles, candidates, enforcedAt, threshold, anchorTXID, headTXID)
+	if err != nil {
+		return err
 	}
-
-	internal.L0RetentionGaugeVec.WithLabelValues(dbName, "eligible").Set(float64(len(deleted)))
+	// Files the planner protected still look "eligible" to the old gauges;
+	// surface them separately in the debug log below.
+	eligible := len(plan.Deleted)
+	internal.L0RetentionGaugeVec.WithLabelValues(dbName, "eligible").Set(float64(eligible))
 	internal.L0RetentionGaugeVec.WithLabelValues(dbName, "not_compacted").Set(float64(notCompactedCount))
 	internal.L0RetentionGaugeVec.WithLabelValues(dbName, "too_recent").Set(float64(tooRecentCount))
 
 	db.Logger.Debug("l0 retention scan complete",
 		"total_l0_files", totalFiles,
-		"eligible_for_deletion", len(deleted),
+		"eligible_for_deletion", eligible,
+		"protected_by_chain", len(plan.Protected),
+		"in_flight", len(plan.InFlight),
 		"not_compacted_yet", notCompactedCount,
 		"too_recent", tooRecentCount,
 		"max_l1_txid", maxL1TXID)
 
-	if len(deleted) == 0 {
-		return nil
-	}
+	executor := NewRetentionExecutor(db.Replica.Client, db.Logger, db.RetentionEnabled)
+	executor.EnforcedAt = enforcedAt
+	executor.LocalFileDeleter = db.deleteLocalLTXFile
 
-	if !db.RetentionEnabled {
-		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
-	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	report, err := executor.Execute(ctx, plan)
+	if err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}
+	LogProtected(db.Logger, report)
 
-	for _, info := range deleted {
-		localPath := db.LTXPath(0, info.MinTXID, info.MaxTXID)
-		db.Logger.Debug("deleting expired local l0 file", "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
-		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
-			db.Logger.Error("failed to remove local l0 file", "path", localPath, "error", err)
-		}
-	}
-	if len(deleted) > 0 {
+	if len(report.Deleted) > 0 {
 		db.invalidatePosCache()
+		db.Logger.Info("l0 retention enforced",
+			"deleted_count", len(report.Deleted),
+			"protected_count", len(report.Protected),
+			"max_l1_txid", maxL1TXID)
 	}
-
-	db.Logger.Info("l0 retention enforced", "deleted_count", len(deleted), "max_l1_txid", maxL1TXID)
 
 	return nil
 }
