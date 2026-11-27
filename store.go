@@ -53,6 +53,12 @@ var (
 	// is interrupted by a done channel signal (e.g., second Ctrl+C).
 	ErrShutdownInterrupted = errors.New("shutdown sync interrupted")
 
+	// ErrShuttingDown is returned by write or WAL-capture entry points after
+	// an ordered shutdown has begun. Callers can treat it as a definitive
+	// rejection and retry the write against the next process instead of
+	// blocking or having the work silently discarded.
+	ErrShuttingDown = errors.New("database is shutting down")
+
 	ErrDatabaseNotFound = errors.New("database not found")
 	ErrDatabaseNotOpen  = errors.New("database not open")
 )

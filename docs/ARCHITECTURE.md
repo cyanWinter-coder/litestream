@@ -77,7 +77,9 @@ sequenceDiagram
 
 The diagram shows the successful replication startup path. A configured restore of a missing database runs before DB construction. Lazy initialization can overlap the remaining startup work; `Open` returning does not mean a replica is caught up. With the WAL monitor disabled, a caller's explicit sync performs initialization.
 
-`DB.Close(ctx)` stops the DB monitor, attempts a final sync, releases the read transaction, and closes the database and replica resources. See [`db.go`](../db.go).
+`DB.Close(ctx)` runs an ordered shutdown. It first calls `BeginShutdown`, after which every write and WAL-capture entry point returns `ErrShuttingDown` instead of queuing or silently dropping work, so callers can retry against the next process. In-flight work holding the executor semaphore is allowed to finish. Close then converts remaining committed WAL frames into local LTX files, flushes the LTX queue to the replica with the configured shutdown retry budget, and only then releases the read transaction and closes the database and replica handles.
+
+The sequence is guarded by an atomic close state so it runs exactly once: repeated signals cannot trigger a second flush or release a handle twice; a Close racing the in-flight shutdown waits for the real result, while a Close after completion is an idempotent no-op. If the flush does not finish (timeout, context cancellation, or a second signal closing the `Done` channel), Close returns a non-nil error and persists the still-queued LTX files with their failure reason to `shutdown-pending.json` in the metadata directory. On the next start, `init` drains that marker via `drainPendingUploads` before normal replication resumes; a still-unavailable remote leaves the marker in place and the replica monitor keeps retrying rather than treating the data as replicated. See [`db.go`](../db.go) and [`shutdown.go`](../shutdown.go).
 
 ## WAL Monitoring and Checkpoints
 

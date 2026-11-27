@@ -67,6 +67,12 @@ type Replica struct {
 	// the position file and removing local LTX files, forcing a fresh sync.
 	// Disabled by default to prevent silent data loss scenarios.
 	AutoRecoverEnabled bool
+
+	// OnUploadFailure, when set, is invoked after an LTX upload fails so the
+	// DB layer can persist the still-queued file together with its failure
+	// reason. Failures of the hook itself are logged at DEBUG and never
+	// alter the returned sync error.
+	OnUploadFailure func(level int, minTXID, maxTXID ltx.TXID, cause error)
 }
 
 func NewReplica(db *DB) *Replica {
@@ -256,6 +262,11 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 
 	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
 	if err != nil {
+		// Record the failed entry with its reason so it stays at the front of
+		// the durable pending-upload queue for the next retry.
+		if r.OnUploadFailure != nil {
+			r.OnUploadFailure(level, minTXID, maxTXID, err)
+		}
 		return fmt.Errorf("write ltx file: %w", err)
 	}
 	r.Logger().Debug("ltx file uploaded",

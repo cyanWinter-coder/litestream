@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 
 	"github.com/mattn/go-shellwords"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -110,6 +111,14 @@ func (c *ReplicateCommand) runUntilStopped(ctx context.Context, signals <-chan o
 		slog.Info("signal received, litestream shutting down", "signal", sig)
 	}
 
+	// Wire the shutdown-interrupt channel before closing the store. A second
+	// signal during the flush closes it exactly once: the retry loop exits,
+	// in-flight syncs are cancelled, but Close still completes its full
+	// cleanup (no second flush, no early handle release).
+	interrupt := make(chan struct{})
+	var interruptOnce sync.Once
+	c.SetDone(interrupt)
+
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.WithoutCancel(ctx), c.Config.ShutdownTimeout)
 	defer cancelShutdown()
 	closed := make(chan error, 1)
@@ -126,20 +135,44 @@ func (c *ReplicateCommand) runUntilStopped(ctx context.Context, signals <-chan o
 		slog.Info("litestream shut down")
 		return nil
 	case sig := <-signals:
+		// Repeated signal: interrupt only the in-flight flush. Closing the
+		// channel is idempotent via sync.Once; the Close goroutine keeps
+		// running and still releases every handle before the process exits.
+		interruptOnce.Do(func() {
+			slog.Warn("second signal received, interrupting shutdown flush", "signal", sig)
+			close(interrupt)
+		})
 		result = errors.Join(result, fmt.Errorf("shutdown interrupted by %s: %w", sig, litestream.ErrShutdownInterrupted))
 	case <-shutdownCtx.Done():
+		// The shutdown budget elapsed while a flush was still retrying.
+		// Interrupt the retry loop the same way a second signal would so the
+		// Close goroutine can finish cleanup promptly instead of blocking
+		// process exit for the full sync-retry timeout.
+		interruptOnce.Do(func() {
+			slog.Warn("shutdown timeout reached, interrupting flush", "timeout", c.Config.ShutdownTimeout)
+			close(interrupt)
+		})
 		result = errors.Join(result, fmt.Errorf("shutdown timed out after %s: %w", c.Config.ShutdownTimeout, shutdownCtx.Err()))
 	}
 
 	cancelRun()
+
+	// The flush has been interrupted above. Do not block process exit waiting
+	// on a Close whose replica network calls may not honor cancellation: the
+	// durable pending-upload marker written by DB.Close guarantees the
+	// un-flushed LTX queue resumes on the next startup. The Close goroutine
+	// continues in the background until the process terminates, and closeOnce
+	// ensures no second flush can start in the meantime.
 	select {
-	case <-ready:
-		if c.cmd != nil && c.cmd.Process != nil {
-			if err := c.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-				result = errors.Join(result, fmt.Errorf("kill exec process: %w", err))
-			}
-		}
+	case err := <-closed:
+		result = errors.Join(result, err)
 	default:
+		slog.Warn("exiting before shutdown cleanup fully completed; pending uploads persisted for next startup")
+	}
+	if c.cmd != nil && c.cmd.Process != nil {
+		if err := c.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			result = errors.Join(result, fmt.Errorf("kill exec process: %w", err))
+		}
 	}
 	return result
 }
@@ -554,10 +587,15 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 	return err
 }
 
-// SetDone sets the done channel used for interrupt handling during shutdown.
-// When the channel is closed, the shutdown sync retry loop exits.
+// SetDone sets the done channel used for interrupt handling during shutdown
+// and propagates it immediately to the running store so databases that were
+// already opened before this call observe the same interrupt channel. When
+// the channel is closed, the shutdown sync retry loop exits.
 func (c *ReplicateCommand) SetDone(done <-chan struct{}) {
 	c.done = done
+	if c.Store != nil {
+		c.Store.SetDone(done)
+	}
 }
 
 // restoreIfNeeded restores a database from its replica if the database doesn't

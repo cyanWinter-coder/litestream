@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -44,6 +45,13 @@ const (
 	// When sync errors occur repeatedly (e.g., disk full), backoff doubles each time.
 	DefaultSyncBackoffMax = 5 * time.Minute  // Maximum backoff between retries
 	SyncErrorLogInterval  = 30 * time.Second // Rate-limit repeated error logging
+)
+
+// Close lifecycle states guarded by DB.closeState.
+const (
+	closeStateIdle    int32 = 0
+	closeStateRunning int32 = 1
+	closeStateDone    int32 = 2
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
@@ -185,6 +193,22 @@ type DB struct {
 	// ShutdownSyncInterval is the time between retry attempts.
 	ShutdownSyncTimeout  time.Duration
 	ShutdownSyncInterval time.Duration
+
+	// shutdownMu guards the ordered-shutdown state below.
+	shutdownMu sync.Mutex
+	// shuttingDown is set by BeginShutdown before the final flush starts.
+	// While true, write and WAL-capture entry points fail with ErrShuttingDown.
+	shuttingDown bool
+	// closeState tracks the Close lifecycle (idle -> running -> done) and
+	// guarantees via CAS that the shutdown sequence runs exactly once, even
+	// under repeated signals. It lets a Close racing an in-flight shutdown
+	// observe the real flush result while a Close after completion behaves as
+	// an idempotent no-op.
+	closeState atomic.Int32
+	// closeErr holds the first Close result for racing callers.
+	closeErr error
+	// closeDone is closed once Close has finished its full cleanup sequence.
+	closeDone chan struct{}
 
 	// lastSuccessfulSyncAt tracks when replication last succeeded.
 	// Used by heartbeat monitoring to determine if a ping should be sent.
@@ -339,10 +363,11 @@ func NewDB(path string) *DB {
 	dir, file := filepath.Split(path)
 
 	db := &DB{
-		path:     path,
-		metaPath: filepath.Join(dir, "."+file+MetaDirSuffix),
-		execSem:  semaphore.NewWeighted(1),
-		notify:   make(chan struct{}),
+		path:      path,
+		metaPath:  filepath.Join(dir, "."+file+MetaDirSuffix),
+		execSem:   semaphore.NewWeighted(1),
+		notify:    make(chan struct{}),
+		closeDone: make(chan struct{}),
 
 		MinCheckpointPageN:   DefaultMinCheckpointPageN,
 		TruncatePageN:        DefaultTruncatePageN,
@@ -860,6 +885,16 @@ func (db *DB) Open() (err error) {
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 	db.mu.Unlock()
 
+	// Reset ordered-shutdown state so a reopened DB accepts writes again.
+	// closeState/closeDone are reset for the new lifecycle; any on-disk
+	// pending marker is handled by drainPendingUploads during init.
+	db.shutdownMu.Lock()
+	db.shuttingDown = false
+	db.shutdownMu.Unlock()
+	db.closeState.Store(closeStateIdle)
+	db.closeErr = nil
+	db.closeDone = make(chan struct{})
+
 	// Close deletes the per-database series, so recreate them.
 	db.initMetrics()
 
@@ -898,10 +933,48 @@ func (db *DB) Open() (err error) {
 	return nil
 }
 
-// Close flushes outstanding WAL writes to replicas, releases the read lock,
-// and closes the database. If Done is set, closing it interrupts the shutdown
-// sync retry loop and cancels any in-flight sync attempt.
-func (db *DB) Close(ctx context.Context) (err error) {
+// Close runs the ordered shutdown sequence: stop accepting new writes, flush
+// acknowledged writes to the replica, then release locks and close handles.
+//
+// closeState guarantees the sequence runs exactly once: repeated shutdown
+// signals cannot trigger a second flush or release a handle twice. A Close
+// racing an in-flight shutdown blocks until the first finishes and receives
+// the same flush result; a Close after completion is an idempotent no-op. If
+// Done is set, closing it interrupts the shutdown sync retry loop and cancels
+// any in-flight sync attempt. A non-nil error means the flush did not finish;
+// the un-uploaded LTX queue is durably recorded under the metadata directory
+// for the next process.
+func (db *DB) Close(ctx context.Context) error {
+	// closeState: 0 = idle, 1 = shutdown in progress, 2 = fully closed.
+	switch state := db.closeState.Load(); {
+	case state == closeStateDone:
+		// A Close after the full sequence completed is an idempotent no-op
+		// (e.g., a deferred cleanup after an explicit Close). It must not
+		// re-surface the first Close's flush error.
+		return nil
+	case db.closeState.CompareAndSwap(closeStateIdle, closeStateRunning):
+		// Won the right to run the single shutdown sequence.
+		db.closeErr = db.closeOnceBody(ctx)
+		db.closeState.Store(closeStateDone)
+		close(db.closeDone)
+		return db.closeErr
+	default:
+		// Shutdown is in flight on another goroutine. Wait without honoring
+		// caller cancellation and report the real flush result so the racing
+		// caller does not assume cleanup finished prematurely.
+		<-db.closeDone
+		return db.closeErr
+	}
+}
+
+// closeOnceBody performs the actual ordered shutdown. It runs at most once per
+// DB instance; see Close for the concurrency contract.
+func (db *DB) closeOnceBody(ctx context.Context) (err error) {
+	// Step 1: stop accepting new write or WAL-capture work before anything is
+	// torn down. In-flight work holding the executor semaphore is allowed to
+	// finish; subsequent entry points fail with ErrShuttingDown.
+	db.BeginShutdown()
+
 	db.cancel()
 	db.wg.Wait()
 
@@ -915,24 +988,53 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	}
 	defer db.execSem.Release(1)
 
-	// Perform a final db sync, if initialized.
+	// Step 2: convert any remaining committed WAL frames into local LTX
+	// files. Failures here are captured but cleanup still runs below.
 	if db.db != nil {
 		if _, e := db.syncLocked(ctx, 0); e != nil {
 			err = e
 		}
 	}
 
-	// Ensure replicas perform a final sync and stop replicating.
+	// Step 3: flush the local LTX queue to the replica, retrying until
+	// success, the configured timeout, context cancellation, or a Done signal.
+	var flushErr error
 	if db.Replica != nil {
 		if db.db != nil {
-			if e := db.syncReplicaWithRetry(ctx); e != nil && err == nil {
-				err = e
+			if e := db.syncReplicaWithRetry(ctx); e != nil {
+				flushErr = e
+				if err == nil {
+					err = e
+				}
 			}
 		}
 		db.Replica.Stop(true)
 	}
 
-	// Release the read lock to allow other applications to handle checkpointing.
+	// Step 4: if the flush did not finish, retain the un-uploaded LTX queue
+	// with the failure reason so the next process resumes from it rather than
+	// treating the data as safely replicated.
+	if flushErr != nil {
+		reason := "shutdown sync timeout"
+		if errors.Is(flushErr, ErrShutdownInterrupted) {
+			reason = "shutdown sync interrupted by signal"
+		}
+		if e := db.recordShutdownPending(reason, flushErr); e != nil {
+			db.Logger.Error("cannot persist shutdown pending state", "error", e)
+			err = errors.Join(err, fmt.Errorf("persist shutdown pending state: %w", e))
+		}
+	} else if db.db != nil {
+		// A clean flush invalidates any marker an earlier failed run left.
+		if e := db.clearShutdownPending(); e != nil {
+			db.Logger.Error("cannot clear shutdown pending state", "error", e)
+			if err == nil {
+				err = e
+			}
+		}
+	}
+
+	// Step 5: release the read lock to allow other applications to handle
+	// checkpointing, then close handles. Nothing after this point accepts work.
 	if db.rtx != nil {
 		if e := db.releaseReadLock(); e != nil && err == nil {
 			err = e
@@ -1217,15 +1319,30 @@ func (db *DB) init(ctx context.Context) (err error) {
 		}
 	}
 
-	// If we have an existing replication files, ensure the headers match.
-	// if err := db.verifyHeadersMatch(); err != nil {
-	// 	return fmt.Errorf("cannot determine last wal position: %w", err)
-	// }
+	// Drain LTX files a previous process failed to flush before it exited.
+	// This runs ahead of the replica monitor so failed uploads and their
+	// reasons are retried before any newly captured write is accepted. A
+	// still-unavailable remote leaves the marker in place; the monitor keeps
+	// retrying rather than treating this data as replicated.
+	if db.Replica != nil && db.HasPendingUploads() {
+		if err := db.drainPendingUploads(ctx); err != nil {
+			db.Logger.Warn("startup drain of pending uploads incomplete; replica monitor will retry",
+				"error", err)
+		}
+	}
 
 	// TODO(gen): Generate diff of current LTX snapshot and save as next LTX file.
 
 	// Start replication.
 	if db.Replica != nil {
+		// Persist failed uploads with their reason so they remain at the head
+		// of the pending-upload queue across a restart. The hook runs while a
+		// replica sync holds its own lock and never takes DB-level locks.
+		db.Replica.OnUploadFailure = func(level int, minTXID, maxTXID ltx.TXID, cause error) {
+			if e := db.recordUploadFailure(level, minTXID, maxTXID, cause); e != nil {
+				db.Logger.Debug("cannot record upload failure", "error", e)
+			}
+		}
 		db.Replica.Start(db.ctx)
 	}
 
@@ -1342,6 +1459,12 @@ func (db *DB) syncOnce(ctx context.Context, maxSyncWALBytes int64) (syncResult, 
 }
 
 func (db *DB) lockExec(ctx context.Context) error {
+	// Reject new write/WAL-capture work as soon as ordered shutdown begins.
+	// The check precedes semaphore acquisition so a shutdown does not queue
+	// behind an in-flight sync and then run after handles start closing.
+	if err := db.checkShutting(); err != nil {
+		return err
+	}
 	if db.execSem.TryAcquire(1) {
 		return nil
 	}
@@ -1350,6 +1473,11 @@ func (db *DB) lockExec(ctx context.Context) error {
 
 	if err := db.execSem.Acquire(ctx, 1); err != nil {
 		return fmt.Errorf("wait for db sync executor: %w", context.Cause(ctx))
+	}
+	// A shutdown may have started while this goroutine waited on the semaphore.
+	if err := db.checkShutting(); err != nil {
+		db.execSem.Release(1)
+		return err
 	}
 	return nil
 }

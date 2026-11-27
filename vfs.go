@@ -40,6 +40,13 @@ const (
 // ErrConflict is returned when the remote replica has newer transactions than expected.
 var ErrConflict = errors.New("remote has newer transactions than expected")
 
+// errVFSShuttingDown wraps the SQLite read-only result code so that write
+// attempts during an ordered shutdown fail with a distinct, errors.Is-able
+// cause instead of a generic read-only rejection. SQLite still surfaces a
+// read-only error to the connection, but callers inspecting the wrapped error
+// can identify the shutdown and retry against the next process.
+var errVFSShuttingDown = fmt.Errorf("%w: vfs shutting down, writes rejected", sqlite3vfs.ReadOnlyError)
+
 var (
 	//go:linkname sqlite3vfsFileMap github.com/psanford/sqlite3vfs.fileMap
 	sqlite3vfsFileMap map[uint64]sqlite3vfs.File
@@ -630,7 +637,11 @@ type VFSFile struct {
 	syncStop      chan struct{}    // Signal to stop sync loop
 	inTransaction bool             // True during active write transaction
 	disabling     bool             // True when write disable is in progress
-	cond          *sync.Cond       // Signals transaction state changes
+	// shuttingDown is set by BeginShutdown. While true, every write-intent
+	// operation returns errVFSShuttingDown rather than queuing or dropping the
+	// write, so the caller receives a definitive rejection it can retry.
+	shuttingDown bool
+	cond         *sync.Cond // Signals transaction state changes
 
 	perConnClient bool // True when client was created from config registry (close on file close)
 
@@ -642,6 +653,13 @@ type VFSFile struct {
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// closeOnce guarantees the full close sequence (sync flush, handle
+	// release, buffer removal) runs exactly once even when SQLite or a
+	// shutdown path calls Close repeatedly. The first Close's result is
+	// returned to every caller.
+	closeOnce sync.Once
+	closeErr  error
 
 	logger *slog.Logger
 
@@ -1618,7 +1636,18 @@ func (f *VFSFile) applySyncedPagesToHydratedFile() error {
 }
 
 func (f *VFSFile) Close() error {
+	f.closeOnce.Do(f.closeOnceBody)
+	return f.closeErr
+}
+
+// closeOnceBody performs the actual close sequence. It runs at most once per
+// VFSFile; see Close for the concurrency contract.
+func (f *VFSFile) closeOnceBody() {
 	f.logger.Debug("closing file")
+
+	// Ordered shutdown: reject any new writes before the final flush. This runs
+	// before f.mu is acquired, so it does not re-enter the mutex.
+	f.BeginShutdown()
 
 	// Stop sync loop and ticker if running (need mutex for syncStop)
 	f.mu.Lock()
@@ -1637,11 +1666,14 @@ func (f *VFSFile) Close() error {
 		f.compactionWg.Wait()
 	}
 
-	// Final sync of dirty pages before closing
+	// Final sync of dirty pages before closing. A failure leaves the dirty
+	// pages in the local write buffer; the next open does not silently treat
+	// them as uploaded.
 	f.mu.Lock()
 	if f.writeEnabled && len(f.dirty) > 0 {
 		if err := f.syncToRemoteWithLock(); err != nil {
 			f.logger.Error("failed to sync on close", "error", err)
+			f.closeErr = err
 		}
 	}
 	f.mu.Unlock()
@@ -1651,7 +1683,9 @@ func (f *VFSFile) Close() error {
 
 	// Close and remove buffer file if open
 	if f.bufferFile != nil {
-		f.bufferFile.Close()
+		if err := f.bufferFile.Close(); err != nil && f.closeErr == nil {
+			f.closeErr = err
+		}
 		os.Remove(f.bufferPath)
 	}
 
@@ -1677,7 +1711,9 @@ func (f *VFSFile) Close() error {
 		}
 	}
 
-	return hydrationErr
+	if hydrationErr != nil && f.closeErr == nil {
+		f.closeErr = hydrationErr
+	}
 }
 
 func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
@@ -1820,6 +1856,11 @@ func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// Reject writes during ordered shutdown with a distinct shutdown cause.
+	if f.shuttingDown {
+		return 0, errVFSShuttingDown
+	}
+
 	// If write support is not enabled, return read-only error
 	if !f.writeEnabled {
 		return 0, sqlite3vfs.ReadOnlyError
@@ -1903,6 +1944,11 @@ func (f *VFSFile) Truncate(size int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// Reject writes during ordered shutdown with a distinct shutdown cause.
+	if f.shuttingDown {
+		return errVFSShuttingDown
+	}
+
 	// If write support is not enabled, return read-only error
 	if !f.writeEnabled {
 		return sqlite3vfs.ReadOnlyError
@@ -1957,6 +2003,27 @@ func (f *VFSFile) Sync(flag sqlite3vfs.SyncType) error {
 // This is equivalent to SetWriteEnabledWithTimeout(enabled, 0) which waits indefinitely.
 func (f *VFSFile) SetWriteEnabled(enabled bool) error {
 	return f.SetWriteEnabledWithTimeout(enabled, 0)
+}
+
+// BeginShutdown transitions the file into the rejecting half of an ordered
+// shutdown. In-flight write transactions are allowed to finish, but every new
+// write-intent lock, WriteAt, Truncate, or Sync fails with a distinct
+// read-only-wrapped shutdown error instead of silently dropping the write.
+// Repeated calls are no-ops.
+func (f *VFSFile) BeginShutdown() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.shuttingDown {
+		f.shuttingDown = true
+		f.logger.Info("vfs shutdown initiated, rejecting new writes")
+	}
+}
+
+// IsShuttingDown reports whether BeginShutdown has been called.
+func (f *VFSFile) IsShuttingDown() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.shuttingDown
 }
 
 // SetWriteEnabledWithTimeout enables or disables write support at runtime with an optional timeout.
@@ -2476,6 +2543,13 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 	}
 
 	if elock >= sqlite3vfs.LockReserved {
+		// During ordered shutdown, reject new write transactions immediately
+		// with a distinct shutdown cause rather than blocking or silently
+		// dropping the write.
+		if f.shuttingDown {
+			return errVFSShuttingDown
+		}
+
 		// Wait for any disable operation to complete before allowing RESERVED lock.
 		// This prevents new write transactions from starting during disable.
 		for f.disabling {
