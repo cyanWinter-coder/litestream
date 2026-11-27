@@ -85,10 +85,22 @@ var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
-	mu       sync.Mutex
-	s3       *s3.Client // s3 service
-	uploader *manager.Uploader
-	logger   *slog.Logger
+	mu     sync.Mutex
+	s3     *s3.Client // s3 service
+	logger *slog.Logger
+
+	// uploads serializes uploads of the same object key so a retried upload
+	// cannot overlap a new sync writing the same path.
+	uploads internal.KeyedMutex
+
+	// multipartDir persists multipart upload state across attempts and
+	// restarts. See SetMultipartStateDir.
+	multipartDir   string
+	multipartStore *internal.MultipartStateStore
+
+	// progress tracks the latest reported upload progress per LTX file.
+	progressMu sync.Mutex
+	progress   map[string]litestream.UploadProgress
 
 	// AWS authentication keys.
 	AccessKeyID     string
@@ -111,6 +123,19 @@ type ReplicaClient struct {
 	// Upload configuration
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
 	Concurrency int   // Number of concurrent parts to upload (default: 5)
+
+	// MultipartRetryPolicy bounds whole-object multipart attempts. Each
+	// attempt reuses parts the provider already confirmed. Zero values select
+	// the defaults.
+	MultipartRetryPolicy internal.RetryPolicy
+
+	// PartRetryPolicy bounds retries of a single part request. Zero values
+	// select the defaults.
+	PartRetryPolicy internal.RetryPolicy
+
+	// PartUploadTimeout bounds a single part request including its retries.
+	// Zero selects two minutes.
+	PartUploadTimeout time.Duration
 
 	// MetadataConcurrency controls parallel HeadObject calls for timestamp-based restore.
 	// Higher values improve restore speed for large backup histories.
@@ -135,6 +160,7 @@ func NewReplicaClient() *ReplicaClient {
 		RequireContentMD5:  true,
 		SignPayload:        true,
 		SignAcceptEncoding: true,
+		multipartStore:     internal.NewMultipartStateStore(""),
 	}
 }
 
@@ -429,7 +455,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Build configuration options
 	configOpts := []func(*config.LoadOptions) error{
 		config.WithRegion(region),
-		config.WithRetryer(newTransportRetryer),
+		config.WithRetryer(transportRetryerFactory),
 	}
 
 	// Add HTTP client with proper timeout
@@ -490,32 +516,6 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 
 	// Create S3 client
 	c.s3 = s3.NewFromConfig(cfg, s3Opts...)
-
-	// Configure uploader with custom options if specified
-	uploaderOpts := []func(*manager.Uploader){}
-
-	// For S3-compatible providers, disable automatic checksum calculation on the Uploader.
-	// The S3 client's RequestChecksumCalculation setting only affects single-part uploads.
-	// Multipart uploads via the Uploader require this separate setting (added in s3/manager v1.20.0).
-	// See: https://github.com/benbjohnson/litestream/issues/948
-	// See: https://github.com/aws/aws-sdk-go-v2/issues/3007
-	if c.Endpoint != "" {
-		uploaderOpts = append(uploaderOpts, func(u *manager.Uploader) {
-			u.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
-		})
-	}
-
-	if c.PartSize > 0 {
-		uploaderOpts = append(uploaderOpts, func(u *manager.Uploader) {
-			u.PartSize = c.PartSize
-		})
-	}
-	if c.Concurrency > 0 {
-		uploaderOpts = append(uploaderOpts, func(u *manager.Uploader) {
-			u.Concurrency = c.Concurrency
-		})
-	}
-	c.uploader = manager.NewUploader(c.s3, uploaderOpts...)
 
 	return nil
 }
@@ -602,6 +602,10 @@ func (c *ReplicaClient) validateSSEConfig() error {
 // backoff between attempts still bounds request rate during outages.
 const transportRetryMaxAttempts = 8
 
+// transportRetryerFactory builds the SDK retryer. It is a variable so tests
+// can shorten the SDK's own retry budget and keep failure-path tests fast.
+var transportRetryerFactory = newTransportRetryer
+
 // newTransportRetryer returns a retryer that keeps retrying through sustained
 // object-store transport flaps. The SDK's default token bucket (and the
 // adaptive mode previously configured here) only refills retry quota on
@@ -634,7 +638,7 @@ func newTransportRetryer() aws.Retryer {
 func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
 	// Build a config with credentials but no region
 	configOpts := []func(*config.LoadOptions) error{
-		config.WithRetryer(newTransportRetryer),
+		config.WithRetryer(transportRetryerFactory),
 	}
 
 	// Add static credentials if provided
@@ -734,6 +738,8 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 // Extracts timestamp from LTX header and stores it in S3 metadata to preserve original creation time.
 // Objects smaller than the part size are written with a single PutObject call
 // to avoid the multipart upload manager's 5 MiB part buffers (issue #1327).
+// Larger objects use a resumable multipart upload that reuses already-confirmed
+// parts after a transient provider failure.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
@@ -741,6 +747,14 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	filename := ltx.FormatFilename(minTXID, maxTXID)
 	key := c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)
+
+	// Serialize writes of the same object. A retried upload and a new sync
+	// task must never write the same path concurrently; different objects
+	// still proceed in parallel.
+	if err := c.uploads.Lock(ctx, key); err != nil {
+		return nil, err
+	}
+	defer c.uploads.Unlock(key)
 
 	partSize := int64(manager.DefaultUploadPartSize)
 	if c.PartSize > 0 {
@@ -754,7 +768,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, fmt.Errorf("s3: upload to %s: part size must be at least %d bytes", key, manager.MinUploadPartSize)
 	}
 
-	size, timestamp, etag, err := c.uploadLTX(ctx, key, r, partSize)
+	size, timestamp, etag, err := c.uploadLTX(ctx, level, minTXID, maxTXID, key, r, partSize)
 	if err != nil {
 		return nil, err
 	}
@@ -777,22 +791,27 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 }
 
 // uploadLTX uploads LTX data from r to key, choosing between a single
-// PutObject and the multipart uploader based on the object size.
-func (c *ReplicaClient) uploadLTX(ctx context.Context, key string, r io.Reader, partSize int64) (int64, time.Time, *string, error) {
+// PutObject and a resumable multipart upload based on the object size.
+func (c *ReplicaClient) uploadLTX(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, key string, r io.Reader, partSize int64) (int64, time.Time, *string, error) {
 	// The L0 replication path passes the local LTX file, so the size is
 	// known up front and the body stays seekable for SDK retries.
 	if rs, ok := r.(io.ReadSeeker); ok {
 		if start, err := rs.Seek(0, io.SeekCurrent); err == nil {
-			return c.uploadSizedLTX(ctx, key, rs, start, partSize)
+			if ra, ok := r.(io.ReaderAt); ok {
+				return c.uploadSizedLTX(ctx, level, minTXID, maxTXID, key, rs, ra, start, partSize)
+			}
+			// Seekable but not random-access: buffer only the multipart
+			// threshold so the single-put fast path still works.
+			return c.uploadSeekableBufferedLTX(ctx, level, minTXID, maxTXID, key, rs, start, partSize)
 		}
 		// Reader does not support seeking (e.g. piped file descriptor);
 		// nothing has been consumed, so treat it as an unsized stream.
 	}
-	return c.uploadStreamedLTX(ctx, key, r, partSize)
+	return c.uploadStreamedLTX(ctx, level, minTXID, maxTXID, key, r, partSize)
 }
 
-// uploadSizedLTX uploads from a seekable reader whose size is known.
-func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, rs io.ReadSeeker, start, partSize int64) (int64, time.Time, *string, error) {
+// uploadSizedLTX uploads from a random-access reader whose size is known.
+func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, key string, rs io.ReadSeeker, ra io.ReaderAt, start, partSize int64) (int64, time.Time, *string, error) {
 	end, err := rs.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, time.Time{}, nil, fmt.Errorf("s3: size ltx file %s: %w", key, err)
@@ -813,10 +832,9 @@ func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, rs io.Re
 		return 0, time.Time{}, nil, fmt.Errorf("s3: rewind ltx file %s: %w", key, err)
 	}
 
-	input := c.putObjectInput(key, timestamp)
-	input.Body = rs
-
-	if size < partSize || (c.PutObjectContentMD5 && size == partSize) {
+	if size <= partSize {
+		input := c.putObjectInput(key, timestamp)
+		input.Body = rs
 		input.ContentLength = aws.Int64(size)
 		out, err := c.putObject(ctx, input)
 		if err != nil {
@@ -825,18 +843,73 @@ func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, rs io.Re
 		return size, timestamp, out.ETag, nil
 	}
 
-	// At or above the part size the uploader splits the seekable body into
-	// section readers without copying it into part buffers.
-	out, err := c.uploader.Upload(ctx, input)
+	// At or above the part size, split the reader into parts without copying
+	// the whole object into memory.
+	src := &seekPartSource{r: ra, start: start, size: size, partSize: partSize, allowParallel: true}
+	etag, err := c.uploadMultipart(ctx, level, minTXID, maxTXID, key, timestamp, src, partSize)
 	if err != nil {
-		return 0, time.Time{}, nil, fmt.Errorf("s3: upload to %s: %w", key, err)
+		return 0, time.Time{}, nil, err
 	}
-	return size, timestamp, out.ETag, nil
+	return size, timestamp, etag, nil
+}
+
+// uploadSeekableBufferedLTX handles a seekable reader that does not implement
+// io.ReaderAt. Small objects still take the single-put path; larger objects
+// fall back to the streaming multipart path.
+func (c *ReplicaClient) uploadSeekableBufferedLTX(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, key string, rs io.ReadSeeker, start, partSize int64) (int64, time.Time, *string, error) {
+	end, err := rs.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, time.Time{}, nil, fmt.Errorf("s3: size ltx file %s: %w", key, err)
+	}
+	size := end - start
+	if _, err := rs.Seek(start, io.SeekStart); err != nil {
+		return 0, time.Time{}, nil, fmt.Errorf("s3: rewind ltx file %s: %w", key, err)
+	}
+
+	hdr, _, err := ltx.PeekHeader(rs)
+	if err != nil {
+		return 0, time.Time{}, nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+	}
+	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
+	if _, err := rs.Seek(start, io.SeekStart); err != nil {
+		return 0, time.Time{}, nil, fmt.Errorf("s3: rewind ltx file %s: %w", key, err)
+	}
+
+	input := c.putObjectInput(key, timestamp)
+	if size <= partSize {
+		input.Body = rs
+		input.ContentLength = aws.Int64(size)
+		out, err := c.putObject(ctx, input)
+		if err != nil {
+			return 0, time.Time{}, nil, fmt.Errorf("s3: put object %s: %w", key, err)
+		}
+		return size, timestamp, out.ETag, nil
+	}
+
+	// Wrap in a readerAt adapter so the resumable path can re-read parts. The
+	// adapter seeks a shared cursor, so parts must be read sequentially.
+	src := &seekPartSource{r: readerAtAdapter{rs: rs}, start: start, size: size, partSize: partSize, allowParallel: false}
+	etag, err := c.uploadMultipart(ctx, level, minTXID, maxTXID, key, timestamp, src, partSize)
+	if err != nil {
+		return 0, time.Time{}, nil, err
+	}
+	return size, timestamp, etag, nil
+}
+
+// readerAtAdapter implements io.ReaderAt for an io.ReadSeeker. It is only used
+// when the source cannot provide a true ReaderAt.
+type readerAtAdapter struct{ rs io.ReadSeeker }
+
+func (a readerAtAdapter) ReadAt(p []byte, off int64) (int, error) {
+	if _, err := a.rs.Seek(off, io.SeekStart); err != nil {
+		return 0, err
+	}
+	return io.ReadFull(a.rs, p)
 }
 
 // uploadStreamedLTX uploads from a reader of unknown size, buffering up to
 // the part size to determine whether the object fits in a single PutObject.
-func (c *ReplicaClient) uploadStreamedLTX(ctx context.Context, key string, r io.Reader, partSize int64) (int64, time.Time, *string, error) {
+func (c *ReplicaClient) uploadStreamedLTX(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, key string, r io.Reader, partSize int64) (int64, time.Time, *string, error) {
 	// Use TeeReader to peek at LTX header while preserving data for upload
 	var buf bytes.Buffer
 	hdr, _, err := ltx.PeekHeader(io.TeeReader(r, &buf))
@@ -849,10 +922,9 @@ func (c *ReplicaClient) uploadStreamedLTX(ctx context.Context, key string, r io.
 		return 0, time.Time{}, nil, fmt.Errorf("s3: buffer ltx stream %s: %w", key, err)
 	}
 
-	input := c.putObjectInput(key, timestamp)
-
 	// Reaching EOF before the part size means the whole object is buffered.
 	if size := int64(buf.Len()); size < partSize {
+		input := c.putObjectInput(key, timestamp)
 		input.Body = bytes.NewReader(buf.Bytes())
 		input.ContentLength = aws.Int64(size)
 		out, err := c.putObject(ctx, input)
@@ -862,14 +934,15 @@ func (c *ReplicaClient) uploadStreamedLTX(ctx context.Context, key string, r io.
 		return size, timestamp, out.ETag, nil
 	}
 
-	// Combine buffered prefix with rest of reader so nothing is re-read.
+	// Combine the buffered prefix with the rest of the reader so nothing is
+	// re-read, and stream it through the resumable multipart uploader.
 	rc := internal.NewReadCounter(io.MultiReader(bytes.NewReader(buf.Bytes()), r))
-	input.Body = rc
-	out, err := c.uploader.Upload(ctx, input)
+	src := &streamPartSource{r: rc, partSize: partSize, next: 1}
+	etag, err := c.uploadMultipart(ctx, level, minTXID, maxTXID, key, timestamp, src, partSize)
 	if err != nil {
-		return 0, time.Time{}, nil, fmt.Errorf("s3: upload to %s: %w", key, err)
+		return 0, time.Time{}, nil, err
 	}
-	return rc.N(), timestamp, out.ETag, nil
+	return rc.N(), timestamp, etag, nil
 }
 
 func (c *ReplicaClient) putObject(ctx context.Context, input *s3.PutObjectInput) (*s3.PutObjectOutput, error) {

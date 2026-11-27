@@ -10,6 +10,7 @@ This document contains detailed code patterns, examples, and anti-patterns for w
 - [Locking Patterns](#locking-patterns)
 - [Compaction Inputs](#compaction-inputs)
 - [Resumable Reader Pattern](#resumable-reader-pattern)
+- [Retryable, Idempotent Uploads](#retryable-idempotent-uploads)
 - [Retention Bypass Pattern](#retention-bypass-pattern)
 - [Conditional Write Pattern (Distributed Locking)](#conditional-write-pattern-distributed-locking)
 - [Timestamp Preservation](#timestamp-preservation)
@@ -193,6 +194,81 @@ type LTXFileOpener interface {
 ### Opening restore streams
 
 `Replica.openRestoreFiles` creates each resumable reader with its expected file size and calls `Open`. If an initial open fails, a subsequent read can retry it. When the reader owns the stream's request context, a stalled read is cancelled after 30 seconds so the reader can reconnect. Retries back off from 250 milliseconds. See [`replica.go`](../replica.go) and [`internal/resumable_reader.go`](../internal/resumable_reader.go).
+
+## Retryable, Idempotent Uploads
+
+Object stores fail transiently: a 5xx, a reset connection, or a provider that
+accepts a request and never answers. An upload must retry those failures
+without re-sending confirmed bytes, without publishing duplicate or corrupt
+objects, and without reporting a position the remote store does not have.
+
+### Retry classification
+
+`internal.Retry` retries an operation until it succeeds, returns a
+non-retryable error, the context is canceled, or the attempt/elapsed budget is
+exhausted. Delays use full jitter (`[0, min(MaxDelay, BaseDelay*2^n))`), which
+spreads retries of many instances across the backoff window instead of
+converging them on the same instants.
+
+`internal.IsRetryable` classifies by HTTP status, provider error code, and
+transport error. Authentication and authorization failures are never
+retryable, and unknown errors are treated as permanent: retrying bad
+credentials only hides the real cause and burns provider quota.
+
+| Classification | Examples | Retried |
+|----------------|----------|---------|
+| Transient | 5xx, 408, 429, reset, timeout, premature EOF | Yes |
+| Authentication | 401, 403, `AccessDenied`, `SignatureDoesNotMatch` | No |
+| Validation / missing | 400, 404, `NoSuchBucket`, `NoSuchUpload` | No |
+| Local precondition | unreadable source, bad part size | No |
+
+### Persisted multipart state
+
+`internal.MultipartStateStore` writes one record per object under the
+database meta directory (`<meta>/uploads`). A record names the provider upload
+ID, the part size, and every confirmed part with its size, byte count, and
+MD5. It is written after each confirmed part and removed only after the
+provider acknowledges completion. A leftover record therefore always means
+"resumable", never "already uploaded".
+
+### S3 resumable multipart
+
+`s3.uploadMultipart` holds a per-object lock for the whole attempt (retries
+included) so a retried upload cannot overlap a new sync writing the same path.
+It then:
+
+1. Loads persisted state and reconciles it with `ListParts`, dropping parts
+   the provider no longer stores. Providers without `ListParts` fall back to
+   the local record.
+2. Re-reads and checksums already-confirmed parts from the local source
+   without re-sending them. A checksum mismatch aborts the partial upload and
+   returns a permanent error, so stale bytes can never be combined into the
+   published object.
+3. Uploads only missing parts, recording each one after the provider confirms
+   it.
+4. Completes the upload only after every part is confirmed. A completion whose
+   response was lost is verified against `HeadObject` size instead of being
+   re-reported as a failure.
+
+`UploadProgress` reports the uploaded and reused byte counts and the remaining
+part count, so a retry's savings are visible in logs and metrics
+(`litestream_replica_upload_retries_total`,
+`litestream_replica_upload_reused_bytes_total`).
+
+### Replica layer
+
+`Replica.uploadLTXFile` serializes uploads per target file. It rewinds the
+local LTX file before each retry and wraps failures in `UploadError`, which
+carries the object identity, attempt count, confirmed/reused bytes, remaining
+parts, and a retryable flag. The replica position advances only after
+`WriteLTXFile` returns successfully, so it always matches the last completed
+upload. Errors that already exhausted a backend's budget pass through instead
+of multiplying the retry window.
+
+See [`internal/retry.go`](../internal/retry.go),
+[`internal/multipart_state.go`](../internal/multipart_state.go),
+[`s3/multipart.go`](../s3/multipart.go), [`upload.go`](../upload.go), and
+[`replica.go`](../replica.go).
 
 ## Retention Bypass Pattern
 

@@ -170,6 +170,16 @@ var (
 		Help: "Number of replica operation errors by type, operation, and error code",
 	}, []string{"replica_type", "operation", "code"})
 
+	UploadRetryCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "litestream_replica_upload_retries_total",
+		Help: "Number of replica upload retries, including the bytes reused from a prior attempt",
+	}, []string{"replica_type", "outcome"})
+
+	UploadReusedBytesCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "litestream_replica_upload_reused_bytes_total",
+		Help: "Bytes of an upload satisfied by parts confirmed on a previous attempt",
+	}, []string{"replica_type"})
+
 	L0RetentionGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "litestream_l0_retention_files_total",
 		Help: "Number of L0 files by status during retention enforcement",

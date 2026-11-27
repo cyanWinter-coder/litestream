@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +25,12 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 	"github.com/benbjohnson/litestream/mock"
 )
+
+// transientHTTPError mimics a provider response error with an HTTP status.
+type transientHTTPError struct{ code int }
+
+func (e *transientHTTPError) Error() string       { return fmt.Sprintf("http status %d", e.code) }
+func (e *transientHTTPError) HTTPStatusCode() int { return e.code }
 
 func TestReplica_Sync(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
@@ -3765,4 +3773,341 @@ func (c *rendezvousOpenClient) OpenLTXFile(ctx context.Context, level int, minTX
 		time.Sleep(time.Millisecond)
 	}
 	return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+// TestReplica_UploadRetriesTransientFailures verifies a retryable upload error
+// is retried and the position advances only after the upload succeeds.
+func TestReplica_UploadRetriesTransientFailures(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+	ctx := t.Context()
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	base := db.Replica.Client
+	// Restore the working client before the deferred Close performs its final sync.
+	defer func() { db.Replica.Client = base }()
+	var attempts atomic.Int64
+	client := &mock.ReplicaClient{
+		LTXFilesFunc:    base.LTXFiles,
+		OpenLTXFileFunc: base.OpenLTXFile,
+		WriteLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+			if attempts.Add(1) == 1 {
+				return nil, fmt.Errorf("upload: %w", &transientHTTPError{code: http.StatusServiceUnavailable})
+			}
+			return base.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+		},
+	}
+	db.Replica.Client = client
+
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("upload attempts=%d, want 2", got)
+	}
+	pos := db.Replica.Pos()
+	if pos.TXID == 0 {
+		t.Fatal("replica position not advanced after successful upload")
+	}
+}
+
+// TestReplica_UploadAuthFailureStopsImmediately verifies authentication
+// failures are not retried and do not advance the position.
+func TestReplica_UploadAuthFailureStopsImmediately(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+	ctx := t.Context()
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	base := db.Replica.Client
+	// Restore the working client before the deferred Close performs its final sync.
+	defer func() { db.Replica.Client = base }()
+	var attempts atomic.Int64
+	db.Replica.Client = &mock.ReplicaClient{
+		LTXFilesFunc:    base.LTXFiles,
+		OpenLTXFileFunc: base.OpenLTXFile,
+		WriteLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+			attempts.Add(1)
+			return nil, fmt.Errorf("upload: %w", &transientHTTPError{code: http.StatusForbidden})
+		},
+	}
+
+	err := db.Replica.Sync(ctx)
+	if err == nil {
+		t.Fatal("expected authentication failure")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("upload attempts=%d, want 1", got)
+	}
+	if !litestream.IsAuthenticationError(err) {
+		t.Fatalf("error does not expose authentication cause: %v", err)
+	}
+	if pos := db.Replica.Pos(); !pos.IsZero() {
+		t.Fatalf("position advanced to %v after failed upload", pos)
+	}
+}
+
+// TestReplica_UploadRetryBudgetExhaustedReportsContext verifies an exhausted
+// retry budget surfaces a diagnosable error carrying the failed object and
+// partial progress.
+func TestReplica_UploadRetryBudgetExhaustedReportsContext(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+	ctx := t.Context()
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	base := db.Replica.Client
+	// Restore the working client before the deferred Close performs its final sync.
+	defer func() { db.Replica.Client = base }()
+	var attempts atomic.Int64
+	db.Replica.Client = &mock.ReplicaClient{
+		LTXFilesFunc:    base.LTXFiles,
+		OpenLTXFileFunc: base.OpenLTXFile,
+		WriteLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+			attempts.Add(1)
+			return nil, fmt.Errorf("upload: %w", &transientHTTPError{code: http.StatusInternalServerError})
+		},
+	}
+
+	err := db.Replica.Sync(ctx)
+	if err == nil {
+		t.Fatal("expected failure")
+	}
+	if !errors.Is(err, litestream.ErrRetryBudgetExhausted) {
+		t.Fatalf("error=%v, want retry budget exhaustion", err)
+	}
+	var uploadErr *litestream.UploadError
+	if !errors.As(err, &uploadErr) {
+		t.Fatalf("error=%T, want *litestream.UploadError", err)
+	}
+	if uploadErr.Level != 0 || uploadErr.MaxTXID == 0 {
+		t.Fatalf("upload error missing object identity: %+v", uploadErr)
+	}
+	if uploadErr.Attempts < 2 {
+		t.Fatalf("upload error attempts=%d, want retries to be recorded", uploadErr.Attempts)
+	}
+	if !uploadErr.Retryable {
+		t.Fatalf("expected upload error to be marked retryable: %+v", uploadErr)
+	}
+	if !strings.Contains(err.Error(), "retry budget exhausted") {
+		t.Fatalf("error text missing exhaustion reason: %v", err)
+	}
+	if got := attempts.Load(); got < 2 {
+		t.Fatalf("attempts=%d, want >= 2", got)
+	}
+}
+
+// TestReplica_PositionMatchesUploadCompletion verifies the replica position is
+// set to exactly the highest successfully uploaded TXID and only after the
+// upload completed, including when an earlier attempt in the batch failed.
+func TestReplica_PositionMatchesUploadCompletion(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+	ctx := t.Context()
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := sqldb.ExecContext(ctx, `INSERT INTO t VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	base := db.Replica.Client
+	// Restore the working client before the deferred Close performs its final sync.
+	defer func() { db.Replica.Client = base }()
+	var uploaded []ltx.TXID
+	var failedOnce atomic.Bool
+	db.Replica.Client = &mock.ReplicaClient{
+		LTXFilesFunc:    base.LTXFiles,
+		OpenLTXFileFunc: base.OpenLTXFile,
+		WriteLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+			// Fail the first upload of the *last* file once. The retry must
+			// succeed without the position ever moving past completed uploads.
+			if maxTXID == 3 && failedOnce.CompareAndSwap(false, true) {
+				return nil, fmt.Errorf("upload: %w", &transientHTTPError{code: http.StatusServiceUnavailable})
+			}
+			info, err := base.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+			if err != nil {
+				return nil, err
+			}
+			uploaded = append(uploaded, maxTXID)
+			return info, nil
+		},
+	}
+
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if !failedOnce.Load() {
+		t.Fatal("test did not inject a failure")
+	}
+	if len(uploaded) != 3 {
+		t.Fatalf("uploaded=%d files, want 3", len(uploaded))
+	}
+	if got, want := db.Replica.Pos().TXID, ltx.TXID(3); got != want {
+		t.Fatalf("replica position=%s, want %s", got, want)
+	}
+
+	// The remote position must match the recorded position.
+	remote, err := db.Replica.MaxLTXFileInfo(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.MaxTXID != db.Replica.Pos().TXID {
+		t.Fatalf("remote max TXID=%s, replica position=%s", remote.MaxTXID, db.Replica.Pos().TXID)
+	}
+}
+
+// TestReplica_UploadRetryDoesNotBlockStreamingCapture verifies the WAL capture
+// path (DB.Sync) keeps making progress while a replica upload is retrying.
+func TestReplica_UploadRetryDoesNotBlockStreamingCapture(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+	ctx := t.Context()
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	base := db.Replica.Client
+	defer func() { db.Replica.Client = base }()
+
+	// Hold the upload until released, simulating a provider that has accepted
+	// one attempt and is slow to respond.
+	release := make(chan struct{})
+	uploadStarted := make(chan struct{}, 1)
+	var attempts atomic.Int64
+	db.Replica.Client = &mock.ReplicaClient{
+		LTXFilesFunc:    base.LTXFiles,
+		OpenLTXFileFunc: base.OpenLTXFile,
+		WriteLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+			if attempts.Add(1) == 1 {
+				select {
+				case uploadStarted <- struct{}{}:
+				default:
+				}
+				<-release
+				return nil, fmt.Errorf("upload: %w", &transientHTTPError{code: http.StatusServiceUnavailable})
+			}
+			return base.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+		},
+	}
+
+	syncDone := make(chan error, 1)
+	go func() { syncDone <- db.Replica.Sync(ctx) }()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// While the upload is blocked, new writes must still be captured to local
+	// LTX files: the replica path is not on the WAL capture critical path.
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO t VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("DB.Sync during replica retry: %v", err)
+	}
+	if pos, err := db.Pos(); err != nil {
+		t.Fatal(err)
+	} else if pos.TXID < 2 {
+		t.Fatalf("local position=%s, want capture to advance during upload", pos.TXID)
+	}
+
+	close(release)
+	if err := <-syncDone; err != nil {
+		t.Fatalf("replica Sync: %v", err)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("upload attempts=%d, want 2", got)
+	}
+}
+
+// TestReplica_ConcurrentSyncsDoNotOverlapSameUpload verifies that two
+// concurrent syncs cannot upload the same object at once, even when the first
+// is retrying.
+func TestReplica_ConcurrentSyncsDoNotOverlapSameUpload(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+	ctx := t.Context()
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	base := db.Replica.Client
+	// Restore the working client before the deferred Close performs its final sync.
+	defer func() { db.Replica.Client = base }()
+	var active, maxActive atomic.Int64
+	var firstFailed atomic.Bool
+	db.Replica.Client = &mock.ReplicaClient{
+		LTXFilesFunc:    base.LTXFiles,
+		OpenLTXFileFunc: base.OpenLTXFile,
+		WriteLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+			n := active.Add(1)
+			for {
+				cur := maxActive.Load()
+				if n <= cur || maxActive.CompareAndSwap(cur, n) {
+					break
+				}
+			}
+			defer active.Add(-1)
+			time.Sleep(20 * time.Millisecond)
+			if firstFailed.CompareAndSwap(false, true) {
+				return nil, fmt.Errorf("upload: %w", &transientHTTPError{code: http.StatusServiceUnavailable})
+			}
+			return base.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+		},
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- db.Replica.Sync(ctx)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Sync: %v", err)
+		}
+	}
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("max concurrent uploads of the same object=%d, want 1", got)
+	}
 }

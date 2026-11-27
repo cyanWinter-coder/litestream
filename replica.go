@@ -42,6 +42,15 @@ type Replica struct {
 	syncSem     *semaphore.Weighted
 	syncWaiters atomic.Int64 // diagnostic instrumentation: goroutines queued on syncSem
 
+	// uploads serializes uploads of the same target file within this process
+	// so a retried upload cannot run concurrently with a new sync task.
+	uploads internal.KeyedMutex
+
+	// inFlightUpload records the LTX file currently being uploaded so
+	// diagnostics can report its retry progress.
+	uploadMu       sync.Mutex
+	inFlightUpload *uploadTarget
+
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
 
@@ -67,7 +76,22 @@ type Replica struct {
 	// the position file and removing local LTX files, forcing a fresh sync.
 	// Disabled by default to prevent silent data loss scenarios.
 	AutoRecoverEnabled bool
+
+	// UploadRetryMaxElapsed bounds how long a single LTX upload may retry
+	// before the error is reported upstream. Retries run on the replica
+	// monitor, not on the WAL capture path, so database writes continue while
+	// an upload is being retried; this bound keeps the reported lag and the
+	// log noise proportional. Zero selects DefaultUploadRetryMaxElapsed.
+	UploadRetryMaxElapsed time.Duration
+
+	// UploadRetryMaxAttempts bounds the number of whole-object upload attempts
+	// for backends that do not report their own retry exhaustion. Zero selects
+	// the default.
+	UploadRetryMaxAttempts int
 }
+
+// DefaultUploadRetryMaxElapsed bounds a single upload's retry window.
+const DefaultUploadRetryMaxElapsed = 60 * time.Second
 
 func NewReplica(db *DB) *Replica {
 	r := &Replica{
@@ -247,6 +271,19 @@ func (r *Replica) lockSync(ctx context.Context) error {
 }
 
 func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (err error) {
+	// Serialize uploads of the same LTX file. A retried upload and a new sync
+	// task must never write the same path concurrently, which would let one
+	// attempt abort or overwrite parts belonging to the other.
+	objKey := uploadObjectKey(r.db.MetaPath(), level, minTXID, maxTXID)
+	key, err := r.acquireUpload(ctx, objKey)
+	if err != nil {
+		return err
+	}
+	defer r.uploads.Unlock(key)
+
+	r.setInFlightUpload(&uploadTarget{Level: level, MinTXID: minTXID, MaxTXID: maxTXID})
+	defer r.setInFlightUpload(nil)
+
 	filename := r.db.LTXPath(level, minTXID, maxTXID)
 	f, err := os.Open(filename)
 	if err != nil {
@@ -254,9 +291,9 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	}
 	defer func() { _ = f.Close() }()
 
-	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
+	info, err := r.writeLTXFileWithRetry(ctx, level, minTXID, maxTXID, f)
 	if err != nil {
-		return fmt.Errorf("write ltx file: %w", err)
+		return err
 	}
 	r.Logger().Debug("ltx file uploaded",
 		"level", info.Level,
@@ -264,11 +301,158 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 		"maxTXID", info.MaxTXID,
 		"size", info.Size)
 
-	// Track current position
-	//replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
-	//replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
-
 	return nil
+}
+
+// uploadRetryPolicy is the retry budget for a single LTX upload. Backends that
+// already retry and resume uploads internally (such as S3) report
+// ErrRetryBudgetExhausted, which this layer passes through instead of
+// multiplying the budget. Backends without their own retry still get
+// whole-object retries with jittered backoff here.
+func (r *Replica) uploadRetryPolicy() internal.RetryPolicy {
+	policy := internal.RetryPolicy{
+		MaxAttempts: 4,
+		BaseDelay:   250 * time.Millisecond,
+		MaxDelay:    10 * time.Second,
+		MaxElapsed:  DefaultUploadRetryMaxElapsed,
+	}
+	if r.UploadRetryMaxAttempts > 0 {
+		policy.MaxAttempts = r.UploadRetryMaxAttempts
+	}
+	if r.UploadRetryMaxElapsed > 0 {
+		policy.MaxElapsed = r.UploadRetryMaxElapsed
+	}
+	if r.SyncInterval > 0 && r.SyncInterval < policy.BaseDelay {
+		policy.BaseDelay = r.SyncInterval
+	}
+	return policy
+}
+
+// writeLTXFileWithRetry uploads one LTX file, retrying transient failures with
+// jittered backoff. Non-retryable errors (authentication, validation, corrupt
+// local source) are returned immediately and never enter the retry queue.
+func (r *Replica) writeLTXFileWithRetry(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, f io.ReadSeeker) (*ltx.FileInfo, error) {
+	var (
+		info     *ltx.FileInfo
+		attempts int
+	)
+	err := internal.Retry(ctx, r.uploadRetryPolicy(), func(retry internal.RetryAttempt) {
+		r.Logger().Warn("retrying ltx upload",
+			"level", level,
+			"minTXID", minTXID,
+			"maxTXID", maxTXID,
+			"attempt", retry.Attempt,
+			"delay", retry.Delay,
+			"progress", r.uploadProgress(level, minTXID, maxTXID),
+			"error", retry.Err)
+	}, func(ctx context.Context) error {
+		attempts++
+		// Rewind the source: a failed attempt may have consumed part of it.
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return internal.Permanent(fmt.Errorf("rewind ltx file: %w", err))
+		}
+		var err error
+		info, err = r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
+		if errors.Is(err, ErrRetryBudgetExhausted) {
+			// The backend already spent its own retry budget and reports the
+			// failure with partial progress. Retrying the whole object again
+			// here would multiply the budgets and delay the error report.
+			return internal.Permanent(err)
+		}
+		return err
+	})
+	if err != nil {
+		// Authentication failures are never retryable, regardless of how the
+		// backend classified them (a 403 on one part must not inherit the
+		// enclosing retryable status).
+		authFailure := IsAuthenticationError(err)
+		retryable := IsRetryable(err) && !authFailure
+
+		// A backend that reports its own upload progress produces a richer
+		// UploadError; keep its counters but fold in the outer attempt count.
+		var uploadErr *UploadError
+		if errors.As(err, &uploadErr) {
+			if authFailure {
+				uploadErr.Retryable = false
+			}
+			uploadErr.Attempts = max(uploadErr.Attempts, attempts)
+			return nil, uploadErr
+		}
+		progress := r.uploadProgress(level, minTXID, maxTXID)
+		progress.Key = uploadObjectKey(r.db.MetaPath(), level, minTXID, maxTXID)
+		progress.Level, progress.MinTXID, progress.MaxTXID = level, minTXID, maxTXID
+		progress.Attempt = max(attempts, 1)
+		return nil, newUploadError(progress, max(attempts, 1), retryable, err)
+	}
+
+	// The position is advanced by the caller only after this returns. Nothing
+	// here records a position, so a failed upload cannot move it.
+	return info, nil
+}
+
+// UploadProgress returns the latest progress of the in-flight upload for an
+// LTX file, if the client reports it. It is exposed for diagnostics so
+// operators can see how much of a retried upload is reused.
+func (r *Replica) UploadProgress(level int, minTXID, maxTXID ltx.TXID) (UploadProgress, bool) {
+	if reporter, ok := r.Client.(UploadProgressReporter); ok {
+		return reporter.UploadProgress(level, minTXID, maxTXID)
+	}
+	return UploadProgress{}, false
+}
+
+// uploadTarget identifies the LTX file currently being uploaded.
+type uploadTarget struct {
+	Level   int
+	MinTXID ltx.TXID
+	MaxTXID ltx.TXID
+}
+
+// CurrentUploadProgress returns progress for the upload in flight, if any.
+func (r *Replica) CurrentUploadProgress() (UploadProgress, bool) {
+	r.uploadMu.Lock()
+	target := r.inFlightUpload
+	r.uploadMu.Unlock()
+	if target == nil {
+		return UploadProgress{}, false
+	}
+	if reporter, ok := r.Client.(UploadProgressReporter); ok {
+		if p, ok := reporter.UploadProgress(target.Level, target.MinTXID, target.MaxTXID); ok {
+			return p, true
+		}
+	}
+	return UploadProgress{Level: target.Level, MinTXID: target.MinTXID, MaxTXID: target.MaxTXID, RemainingParts: -1}, true
+}
+
+func (r *Replica) setInFlightUpload(target *uploadTarget) {
+	r.uploadMu.Lock()
+	r.inFlightUpload = target
+	r.uploadMu.Unlock()
+}
+
+// uploadProgress returns the backend's latest progress for an upload, if the
+// backend reports it.
+func (r *Replica) uploadProgress(level int, minTXID, maxTXID ltx.TXID) UploadProgress {
+	if reporter, ok := r.Client.(UploadProgressReporter); ok {
+		if p, ok := reporter.UploadProgress(level, minTXID, maxTXID); ok {
+			return p
+		}
+	}
+	return UploadProgress{Level: level, MinTXID: minTXID, MaxTXID: maxTXID, RemainingParts: -1}
+}
+
+// acquireUpload takes the per-object upload lock, honoring context cancelation.
+func (r *Replica) acquireUpload(ctx context.Context, objKey string) (string, error) {
+	if err := r.uploads.Lock(ctx, objKey); err != nil {
+		return "", fmt.Errorf("wait for ltx upload: %w", err)
+	}
+	return objKey, nil
+}
+
+// uploadObjectKey identifies an upload target. The local meta path scopes it
+// per database so two databases uploading the same TXID range do not block
+// each other.
+func uploadObjectKey(metaPath string, level int, minTXID, maxTXID ltx.TXID) string {
+	return metaPath + "|" + ltx.FormatFilename(minTXID, maxTXID) + fmt.Sprintf("|%04x", level)
 }
 
 // calcPos returns the last position saved to the replica for level 0.

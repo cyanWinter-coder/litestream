@@ -332,6 +332,11 @@ type SyncDiagnostic struct {
 	ExecutorWaiterCount int        `json:"executor_waiter_count,omitempty"`
 	ExecutorWaitStarted *time.Time `json:"executor_wait_started_at,omitempty"`
 	ExecutorWaitSeconds float64    `json:"executor_wait_seconds,omitempty"`
+
+	// Upload holds retry progress for the LTX upload in flight, if any. It is
+	// present only while a replica upload is running and lets operators see
+	// how much of a retried upload was reused instead of re-sent.
+	Upload *UploadProgress `json:"upload,omitempty"`
 }
 
 // NewDB returns a new instance of DB for a given path.
@@ -500,6 +505,11 @@ func (db *DB) SyncDiagnostic() SyncDiagnostic {
 	if !db.syncDiag.updatedAt.IsZero() {
 		updatedAt := db.syncDiag.updatedAt
 		diag.UpdatedAt = &updatedAt
+	}
+	if db.Replica != nil {
+		if progress, ok := db.Replica.CurrentUploadProgress(); ok {
+			diag.Upload = &progress
+		}
 	}
 	if !db.syncDiag.startedAt.IsZero() {
 		end := db.syncDiag.updatedAt
@@ -883,6 +893,13 @@ func (db *DB) Open() (err error) {
 	db.compactor.VerifyCompaction = db.VerifyCompaction
 	db.compactor.RetentionEnabled = db.RetentionEnabled
 	db.compactor.client = db.Replica.Client
+
+	// Point resumable uploads at this database's meta directory so confirmed
+	// part numbers survive a restart. Directory-based databases each get their
+	// own meta path, so their upload state cannot collide.
+	if setter, ok := db.Replica.Client.(UploadStateDirSetter); ok {
+		setter.SetMultipartStateDir(filepath.Join(db.metaPath, internal.MultipartStateDirName))
+	}
 
 	// Start monitoring SQLite database in a separate goroutine.
 	if db.MonitorInterval > 0 {

@@ -35,6 +35,27 @@ Pass the caller's context to storage requests and preserve underlying errors wit
 
 Long restore and compaction streams can be interrupted midway. `ResumableReader` can reopen a stream at the current byte offset after a read failure or a premature EOF when the expected size is known. Correct byte-range behavior is required for the resumed stream to reconstruct the original data. See [`internal/resumable_reader.go`](../internal/resumable_reader.go), [`replica.go`](../replica.go), and [`compactor.go`](../compactor.go).
 
+## Retryable Writes
+
+A backend may implement `SetMultipartStateDir(dir string)` to receive a
+per-database local directory for resumable upload state. The DB layer calls it
+once in `DB.Open`; directory-based databases each get their own directory.
+Reuse the helpers in [`internal/retry.go`](../internal/retry.go) for
+classification and jittered backoff so all backends agree on what is
+retryable.
+
+`WriteLTXFile` must be idempotent for a given `(level, minTXID, maxTXID)`:
+retrying it must not create a second object or publish partial data. The S3
+backend implements this with a persisted multipart upload whose confirmed
+parts are reused and whose completion is written only after every part is
+confirmed; see [`s3/multipart.go`](../s3/multipart.go). Backends that can
+report progress implement `UploadProgressReporter`; the replica layer logs it
+on every retry and includes it in `UploadError`.
+
+Tests must cover a transient failure that resumes without re-sending confirmed
+bytes, an authentication failure that is not retried, and a failed completion
+that does not leave the object marked complete.
+
 ## Testing
 
 The shared `TestReplicaClient_*` tests exercise writes, ordered listings, partial reads, missing objects, timestamp preservation, and deletion. Use a valid LTX header in storage test data, as `createLTXDataWithTimestamp` does. Add a backend to the shared test harness in [`internal/testingutil/testingutil.go`](../internal/testingutil/testingutil.go) when applicable. Use the callback-based [`mock.ReplicaClient`](../mock/replica_client.go) for tests of callers. See [`replica_client_test.go`](../replica_client_test.go) for the shared tests.
