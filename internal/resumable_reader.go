@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream/integrity"
 )
 
 type LTXFileOpener interface {
@@ -148,6 +150,13 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 
 		n, err := r.readStream(rc, cancel, p)
 		r.offset += int64(n)
+
+		// A content digest mismatch is permanent. Reopening the same range
+		// and retrying would only delay the same rejection.
+		if integrity.IsMismatch(err) {
+			r.err = err
+			return n, err
+		}
 
 		if err == nil {
 			if n > 0 && n == len(p) {

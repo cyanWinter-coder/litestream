@@ -16,6 +16,7 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/integrity"
 	"github.com/benbjohnson/litestream/internal"
 )
 
@@ -35,6 +36,11 @@ type ReplicaClient struct {
 
 	Replica *litestream.Replica
 	logger  *slog.Logger
+
+	// RequireIntegrityManifest causes opens of legacy files without a chunk
+	// manifest to fail with integrity.ErrUnverified instead of returning an
+	// explicitly unverified reader.
+	RequireIntegrityManifest bool
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -142,15 +148,12 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			_ = f.Close()
 			return nil, err
 		}
 	}
 
-	if size > 0 {
-		return internal.LimitReadCloser(f, size), nil
-	}
-
-	return f, nil
+	return c.wrapIntegrityReadCloser(path, integrityFileID(level, minTXID, maxTXID), f, offset, size)
 }
 
 // WriteLTXFile writes an LTX file to the replica.
@@ -197,8 +200,27 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		}
 	}()
 
-	if _, err := io.Copy(f, fullReader); err != nil {
-		return nil, err
+	// Hash while writing. This adds CPU work to the unavoidable write pass but
+	// never re-reads the completed file.
+	fileID := integrityFileID(level, minTXID, maxTXID)
+	generator := integrity.NewGenerator(fileID, integrity.FileVersion{}, integrity.DefaultChunkSize)
+	if _, err := io.Copy(f, io.TeeReader(fullReader, generator)); err != nil {
+		return nil, &integrity.Error{
+			FileID:     fileID,
+			ID:         fileID,
+			Path:       filename,
+			Side:       integrity.SideLocal,
+			Domain:     integrity.SideLocal,
+			Fault:      integrity.SideLocal,
+			Op:         integrity.OpWrite,
+			Status:     integrity.StatusFailed,
+			Kind:       "write_stream",
+			Reason:     "write_stream",
+			Type:       "write_stream",
+			ChunkIndex: -1,
+			Offset:     generator.N(),
+			Err:        err,
+		}
 	}
 	if err := f.Sync(); err != nil {
 		return nil, err
@@ -221,6 +243,10 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, err
 	}
 
+	// Preserve evidence if a previous version of this immutable ID failed
+	// verification before the atomic rename replaces the canonical path.
+	c.preserveBadFileBeforeReplace(fileID, filename)
+
 	// Move LTX file to final path when it has been written & synced to disk.
 	if err := os.Rename(tmpFilename, filename); err != nil {
 		return nil, err
@@ -234,6 +260,11 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, err
 	}
 
+	if _, err := c.saveWriteManifest(ctx, fileID, generator, timestamp); err != nil {
+		return nil, err
+	}
+	_ = os.Remove(c.badMarkerPath(fileID))
+
 	return info, nil
 }
 
@@ -244,7 +275,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 
 		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", filename)
 
-		if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
+		if err := c.deleteLTXFile(info); err != nil {
 			return err
 		}
 	}

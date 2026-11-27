@@ -31,11 +31,10 @@ const (
 
 // Litestream errors.
 var (
-	ErrNoSnapshots      = errors.New("no snapshots available")
-	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
-	ErrLTXCorrupted     = errors.New("ltx file corrupted")
-	ErrLTXMissing       = errors.New("ltx file missing")
-	ErrDiskFull         = errors.New("disk full")
+	ErrNoSnapshots  = errors.New("no snapshots available")
+	ErrLTXCorrupted = errors.New("ltx file corrupted")
+	ErrLTXMissing   = errors.New("ltx file missing")
+	ErrDiskFull     = errors.New("disk full")
 )
 
 // LTXError provides detailed context for LTX file errors with recovery hints.
